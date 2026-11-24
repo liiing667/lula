@@ -6,10 +6,12 @@ import { parse as parseCSVSync } from 'csv-parse/sync';
 import * as XLSX from 'xlsx-republish';
 import express from 'express';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import * as fsModule from 'fs';
+import * as nodeFsModule from 'node:fs';
 import { glob } from 'glob';
 import * as yaml from 'js-yaml';
 import multer from 'multer';
-import { dirname, join, relative } from 'path';
+import { dirname, isAbsolute, join, relative, sep } from 'path';
 import { debug } from '../utils/debug';
 import { getServerState, getCurrentControlSetPath } from './serverState';
 import { GitHistoryUtil } from './infrastructure/gitHistory';
@@ -33,6 +35,40 @@ const upload = multer({
 	limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
 });
 
+/**
+ * Resolve a path without letting an unavailable/mocked realpath break
+ * discovery. If the path cannot be resolved we fall back to the lexical path
+ * and let the normal read/parse handling report the problem.
+ */
+function tryRealpath(path: string): string | null {
+	try {
+		let realpathSync: ((input: string) => string) | undefined;
+		for (const fsNamespace of [fsModule, nodeFsModule]) {
+			try {
+				const candidate = (fsNamespace as { realpathSync?: (input: string) => string }).realpathSync;
+				if (typeof candidate === 'function') {
+					realpathSync = candidate;
+					break;
+				}
+			} catch {
+				// Try the next module namespace (fs/node:fs may be mocked separately).
+			}
+		}
+		if (typeof realpathSync !== 'function') {
+			return null;
+		}
+		const resolved = realpathSync(path);
+		return typeof resolved === 'string' ? resolved : null;
+	} catch {
+		return null;
+	}
+}
+
+function isWithinRoot(root: string, candidate: string): boolean {
+	const rel = relative(root, candidate);
+	return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 // Scan for existing lula.yaml files
 // Export the scan function for reuse
 export async function scanControlSets() {
@@ -47,7 +83,32 @@ export async function scanControlSets() {
 		maxDepth: 5
 	});
 
+	// `**/lula.yaml` also matches files reached through symlinked directories.
+	// A link that escapes the control-set root must not appear in the listing:
+	// selecting it would make currentPath point outside the repository. Links
+	// that resolve inside the root (and normal nested directories) are kept.
+	const realBaseDir = tryRealpath(baseDir);
+
 	const controlSets = files
+		.filter((file) => {
+			const fullPath = join(baseDir, file);
+			// Reject lexically escaping results as well (defence in depth for
+			// mocked/alternative glob implementations).
+			const lexical = relative(baseDir, fullPath);
+			if (lexical === '..' || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) {
+				return false;
+			}
+			if (realBaseDir === null) {
+				// realpath is unavailable (for example in a mocked test
+				// environment); the lexical containment check above is the
+				// best we can do.
+				return true;
+			}
+			const realFile = tryRealpath(fullPath);
+			// A file that cannot be resolved is either broken or otherwise
+			// unreachable; it must not leak into the client listing.
+			return realFile !== null && isWithinRoot(realBaseDir, realFile);
+		})
 		.map((file) => {
 			const fullPath = join(baseDir, file);
 			const dirPath = dirname(fullPath);

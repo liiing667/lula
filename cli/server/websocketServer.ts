@@ -6,11 +6,11 @@
  * Handles control updates, state synchronization, and control set switching
  */
 
-import { readFileSync } from 'fs';
+import * as fsModule from 'fs';
 import { Server } from 'http';
 import * as yaml from 'js-yaml';
 import crypto from 'node:crypto';
-import { join } from 'path';
+import { join, relative } from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { debug } from '../utils/debug';
 import { getControlId } from './infrastructure/controlHelpers';
@@ -57,6 +57,63 @@ interface ControlSetMetadata {
 		fields?: Record<string, unknown>;
 	};
 	[key: string]: unknown;
+}
+
+const UNKNOWN_CONTROL_SET: ControlSetMetadata = {
+	id: 'unknown',
+	name: 'Unknown Control Set'
+};
+
+/**
+ * Return metadata that belongs to the committed generation. Falling back to
+ * the file on disk is only for callers that pass a state object that predates
+ * generation metadata (e.g. tests or older integrations).
+ */
+function getCommittedMetadata(
+	state: ReturnType<typeof getServerState>,
+	currentPath: string
+): ControlSetMetadata {
+	const committed = (state as { metadata?: ControlSetMetadata }).metadata;
+	if (committed && typeof committed === 'object' && Object.keys(committed).length > 0) {
+		return committed;
+	}
+
+	try {
+		const controlSetFile = join(currentPath, 'lula.yaml');
+		const content = fsModule.readFileSync(controlSetFile, 'utf8');
+		const parsed = yaml.load(content) as ControlSetMetadata | null | undefined;
+		return parsed && typeof parsed === 'object' ? parsed : UNKNOWN_CONTROL_SET;
+	} catch {
+		// No control set file - use defaults.
+		return UNKNOWN_CONTROL_SET;
+	}
+}
+
+/**
+ * The path that belongs to the same generation as the state caches. Using the
+ * path stored on the state prevents a switch/retry from changing currentPath
+ * while the client is still rendering the previous catalog.
+ */
+function getCommittedPath(state: ReturnType<typeof getServerState>): string {
+	const committedPath = (state as { currentPath?: string }).currentPath;
+	return committedPath || getCurrentControlSetPath();
+}
+
+/**
+ * The client compares currentPath with the relative `path` values returned
+ * by scanControlSets. Keep the filesystem-facing absolute path on the server
+ * and send the same relative form that discovery produced.
+ */
+function getClientControlSetPath(
+	state: ReturnType<typeof getServerState>,
+	absolutePath: string
+): string {
+	const root = state.CONTROL_SET_DIR;
+	if (!root) {
+		return absolutePath;
+	}
+	const rel = relative(root, absolutePath);
+	return rel === '' ? '.' : rel;
 }
 
 /**
@@ -202,32 +259,77 @@ class WebSocketManager {
 				}
 
 				case 'refresh-controls': {
-					// Clear the controls cache and reload from disk
-					const state = getServerState();
-					state.controlsCache.clear();
-					state.controlsByFamily.clear();
-
-					// Reload all controls from disk
+					// Reload from disk. loadAllData stages the new generation and
+					// only commits it when the complete load succeeds, so the old
+					// cache can never be mixed with files from a failed attempt.
 					const { loadAllData } = await import('./serverState');
-					await loadAllData();
-
-					// Broadcast updated state to all clients
-					this.broadcastState();
+					const loaded = await loadAllData();
+					if (loaded !== false) {
+						// Broadcast the newly committed generation.
+						this.broadcastState();
+					}
 					break;
 				}
 
 				case 'switch-control-set': {
 					if (payload && payload.path) {
-						// Import the necessary functions
-						const { initializeServerState, loadAllData } = await import('./serverState');
+						const serverStateModule = await import('./serverState');
 						const currentState = getServerState();
+						const stateModule = serverStateModule as typeof serverStateModule & {
+							switchServerState?: (dir: string, subdir?: string) => Promise<boolean>;
+							switchControlSet?: (dir: string, subdir?: string) => Promise<boolean>;
+						};
+						const switchState = stateModule.switchServerState ?? stateModule.switchControlSet;
 
-						// Switch to new control set
-						initializeServerState(currentState.CONTROL_SET_DIR, payload.path as string);
-						await loadAllData();
+						if (typeof switchState === 'function') {
+							// Preferred path: build and load the candidate generation
+							// off to the side. A failed load leaves the previous
+							// generation (and currentPath) committed.
+							const switched = await switchState(
+								currentState.CONTROL_SET_DIR,
+								payload.path as string
+							);
+							if (switched) {
+								this.broadcastState();
+							} else {
+								ws.send(
+									JSON.stringify({
+										type: 'error',
+										payload: {
+											message: `Failed to load control set: ${payload.path}`
+										}
+									})
+								);
+							}
+						} else {
+							// Fallback for integrations that only provide the
+							// original initialize/load pair.
+							const previous = {
+								controlSetDir: currentState.CONTROL_SET_DIR,
+								currentSubdir: currentState.currentSubdir ?? '.'
+							};
 
-						// Broadcast new state to all clients
-						this.broadcastState();
+							try {
+								serverStateModule.initializeServerState(
+									previous.controlSetDir,
+									payload.path as string
+								);
+								const loaded = await serverStateModule.loadAllData();
+								if (loaded === false) {
+									throw new Error(`Failed to load control set: ${payload.path}`);
+								}
+								this.broadcastState();
+							} catch (error) {
+								// Roll back to the previously committed control set
+								// before telling the client about the failure.
+								serverStateModule.initializeServerState(
+									previous.controlSetDir,
+									previous.currentSubdir
+								);
+								await serverStateModule.loadAllData();
+								throw error;
+							}
+						}
 					}
 					break;
 				}
@@ -617,28 +719,22 @@ class WebSocketManager {
 	private getCompleteState(): Record<string, unknown> | null {
 		try {
 			const state = getServerState();
-			const currentPath = getCurrentControlSetPath();
-
-			// Load control set metadata and merge it with the state
-			let controlSetData: ControlSetMetadata = {};
-			try {
-				const controlSetFile = join(currentPath, 'lula.yaml');
-				const content = readFileSync(controlSetFile, 'utf8');
-				controlSetData = yaml.load(content) as ControlSetMetadata;
-			} catch {
-				// No control set file - use defaults
-				controlSetData = {
-					id: 'unknown',
-					name: 'Unknown Control Set'
-				};
-			}
+			// Capture one generation for the entire payload. currentPath,
+			// metadata, controls, mappings and families all come from the same
+			// committed snapshot.
+			const absolutePath = getCommittedPath(state);
+			const currentPath = getClientControlSetPath(state, absolutePath);
+			const controlSetData = getCommittedMetadata(state, absolutePath);
+			const controls = Array.from(state.controlsCache.values());
+			const mappings = Array.from(state.mappingsCache.values());
+			const families = Array.from(state.controlsByFamily.keys()).sort();
 
 			// For initial state, send all schema fields that exist in controls
 			// This ensures consistency with sendStateInChunks behavior
 			// we implemented this because there was a bug in our filter behavior
-			const controlsMetadata = Array.from(state.controlsCache.values()).map((control) => {
+			const controlsMetadata = controls.map((control) => {
 				if (!control.id) {
-					control.id = getControlId(control, currentPath);
+					control.id = getControlId(control, absolutePath);
 				}
 
 				// Always include id and family as they're essential
@@ -671,10 +767,10 @@ class WebSocketManager {
 				...controlSetData, // Spread control set properties at root level
 				currentPath: currentPath,
 				controls: controlsMetadata, // Send lightweight metadata instead of full controls
-				mappings: Array.from(state.mappingsCache.values()),
-				families: Array.from(state.controlsByFamily.keys()).sort(),
-				totalControls: state.controlsCache.size,
-				totalMappings: state.mappingsCache.size
+				mappings: mappings,
+				families: families,
+				totalControls: controls.length,
+				totalMappings: mappings.length
 			};
 		} catch (error) {
 			console.error('Error getting complete state:', error);
@@ -690,20 +786,15 @@ class WebSocketManager {
 	private sendStateInChunks(ws: WebSocket, fullData = false): void {
 		try {
 			const state = getServerState();
-			const currentPath = getCurrentControlSetPath();
-
-			// Load control set metadata
-			let controlSetData: ControlSetMetadata = {};
-			try {
-				const controlSetFile = join(currentPath, 'lula.yaml');
-				const content = readFileSync(controlSetFile, 'utf8');
-				controlSetData = yaml.load(content) as ControlSetMetadata;
-			} catch {
-				controlSetData = {
-					id: 'unknown',
-					name: 'Unknown Control Set'
-				};
-			}
+			// Freeze the snapshot before scheduling the chunked sends. Without
+			// this a switch or retry could change the cached maps while the
+			// timers are pending, producing a metadata/controls mismatch.
+			const absolutePath = getCommittedPath(state);
+			const currentPath = getClientControlSetPath(state, absolutePath);
+			const controlSetData = getCommittedMetadata(state, absolutePath);
+			const controls = Array.from(state.controlsCache.values());
+			const mappings = Array.from(state.mappingsCache.values());
+			const families = Array.from(state.controlsByFamily.keys()).sort();
 
 			// Send metadata first
 			ws.send(
@@ -712,18 +803,18 @@ class WebSocketManager {
 					payload: {
 						...controlSetData,
 						currentPath: currentPath,
-						families: Array.from(state.controlsByFamily.keys()).sort(),
-						totalControls: state.controlsCache.size,
-						totalMappings: state.mappingsCache.size
+						families: families,
+						totalControls: controls.length,
+						totalMappings: mappings.length
 					}
 				})
 			);
 
 			// Prepare control summaries (lightweight version for table display)
-			const controlSummaries = Array.from(state.controlsCache.values()).map((control) => {
+			const controlSummaries = controls.map((control) => {
 				// Always include id and family as they're essential
 				// Use getControlId to ensure we get the correct ID field
-				const controlId = control.id || getControlId(control, currentPath);
+				const controlId = control.id || getControlId(control, absolutePath);
 				const summary: Record<string, unknown> = {
 					id: controlId,
 					family:
@@ -756,7 +847,7 @@ class WebSocketManager {
 				ws.send(
 					JSON.stringify({
 						type: 'controls-update',
-						payload: fullData ? Array.from(state.controlsCache.values()) : controlSummaries
+						payload: fullData ? controls : controlSummaries
 					})
 				);
 			}, 10);
@@ -766,7 +857,7 @@ class WebSocketManager {
 				ws.send(
 					JSON.stringify({
 						type: 'mappings-update',
-						payload: Array.from(state.mappingsCache.values())
+						payload: mappings
 					})
 				);
 			}, 20);
