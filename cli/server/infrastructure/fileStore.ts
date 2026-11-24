@@ -18,7 +18,7 @@ import {
 	writeFileSync
 } from 'fs';
 import * as yaml from 'js-yaml';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import type { Control, Mapping } from '../types';
 import { getControlId } from './controlHelpers';
 
@@ -46,6 +46,14 @@ export class FileStore {
 	private controlsDir: string;
 	private mappingsDir: string;
 
+	/**
+	 * Sequences that are never valid in a control ID.
+	 * Blocks path separators, parent traversal, Windows drive letters/ADS
+	 * and null bytes so a control ID can never escape the control set root.
+	 */
+	// eslint-disable-next-line no-control-regex
+	private static readonly FORBIDDEN_CONTROL_ID_PATTERN = /[\\/:\0]|\.\./;
+
 	// Simple cache - just control ID to filename mapping
 	private controlMetadataCache = new Map<string, ControlMetadata>();
 
@@ -61,6 +69,44 @@ export class FileStore {
 		if (existsSync(this.controlsDir)) {
 			this.refreshControlsCache();
 		}
+	}
+
+	/**
+	 * Validate a control ID before it is used to derive file system paths.
+	 * Legal IDs such as AC-1, AC-1.1 and AC-1_1 are unaffected; anything that
+	 * could traverse out of the control set root is rejected.
+	 *
+	 * @param controlId - The control ID to validate
+	 * @throws Error if the ID is empty or could escape the control set root
+	 */
+	private assertValidControlId(controlId: string): void {
+		if (
+			typeof controlId !== 'string' ||
+			controlId.length === 0 ||
+			FileStore.FORBIDDEN_CONTROL_ID_PATTERN.test(controlId)
+		) {
+			throw new Error(
+				`Invalid control ID ${JSON.stringify(controlId)}: control IDs must not contain path separators, '..', drive letters or null bytes`
+			);
+		}
+	}
+
+	/**
+	 * Resolve path segments against a root directory, ensuring the result
+	 * stays inside that root. Defense in depth on top of control ID validation.
+	 *
+	 * @param root - The root directory that must contain the result
+	 * @param segments - Path segments to resolve under the root
+	 * @returns The resolved absolute path, guaranteed to be within root
+	 * @throws Error if the resolved path escapes the root
+	 */
+	private resolveWithin(root: string, ...segments: string[]): string {
+		const resolvedRoot = resolve(root);
+		const resolvedPath = resolve(resolvedRoot, ...segments);
+		if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(resolvedRoot + sep)) {
+			throw new Error(`Resolved path escapes the control set root: ${resolvedPath}`);
+		}
+		return resolvedPath;
 	}
 
 	/**
@@ -99,6 +145,11 @@ export class FileStore {
 				}
 			} catch (error) {
 				console.error(`Error processing mapping file ${file}:`, error);
+				// Surface the failure so callers (e.g. the WebSocket layer) do not
+				// update caches or report success for a write that never happened
+				throw new Error(
+					`Failed to update mapping in ${file}: ${error instanceof Error ? error.message : String(error)}`
+				);
 			}
 		}
 	}
@@ -161,6 +212,9 @@ export class FileStore {
 	 * Load a control by ID
 	 */
 	async loadControl(controlId: string): Promise<Control | null> {
+		// Reject control IDs that could resolve outside the control set root
+		this.assertValidControlId(controlId);
+
 		// controlId might be either the actual control ID (AC-1.1) or the filename without extension (AC-1_1)
 		// We need to handle both cases
 
@@ -171,8 +225,8 @@ export class FileStore {
 		// Try flat structure first (atomic controls)
 		// Try both the original ID and sanitized version
 		const possibleFlatPaths = [
-			join(this.controlsDir, `${controlId}.yaml`),
-			join(this.controlsDir, `${sanitizedId}.yaml`)
+			this.resolveWithin(this.controlsDir, `${controlId}.yaml`),
+			this.resolveWithin(this.controlsDir, `${sanitizedId}.yaml`)
 		];
 
 		for (const flatFilePath of possibleFlatPaths) {
@@ -202,12 +256,12 @@ export class FileStore {
 
 		// Fallback to family-based structure
 		const family = this.getControlFamily(controlId);
-		const familyDir = join(this.controlsDir, family);
+		const familyDir = this.resolveWithin(this.controlsDir, family);
 
 		// Try both formats in family directory
 		const possibleFamilyPaths = [
-			join(familyDir, `${controlId}.yaml`),
-			join(familyDir, `${sanitizedId}.yaml`)
+			this.resolveWithin(familyDir, `${controlId}.yaml`),
+			this.resolveWithin(familyDir, `${sanitizedId}.yaml`)
 		];
 
 		for (const filePath of possibleFamilyPaths) {
@@ -247,10 +301,11 @@ export class FileStore {
 		this.ensureDirectories();
 
 		const controlId = getControlId(control, this.baseDir);
+		this.assertValidControlId(controlId);
 		const family = this.getControlFamily(controlId);
 		const filename = this.getControlFilename(controlId);
-		const familyDir = join(this.controlsDir, family);
-		const filePath = join(familyDir, filename);
+		const familyDir = this.resolveWithin(this.controlsDir, family);
+		const filePath = this.resolveWithin(familyDir, filename);
 
 		// Ensure family directory exists
 		if (!existsSync(familyDir)) {
@@ -334,10 +389,11 @@ export class FileStore {
 	 * Delete a control
 	 */
 	async deleteControl(controlId: string): Promise<void> {
+		this.assertValidControlId(controlId);
 		const family = this.getControlFamily(controlId);
 		const filename = this.getControlFilename(controlId);
-		const familyDir = join(this.controlsDir, family);
-		const filePath = join(familyDir, filename);
+		const familyDir = this.resolveWithin(this.controlsDir, family);
+		const filePath = this.resolveWithin(familyDir, filename);
 
 		if (existsSync(filePath)) {
 			unlinkSync(filePath);
@@ -506,9 +562,10 @@ export class FileStore {
 		this.ensureDirectories();
 
 		const controlId = mapping.control_id;
+		this.assertValidControlId(controlId);
 		const family = this.getControlFamily(controlId);
-		const familyDir = join(this.mappingsDir, family);
-		const mappingFile = join(
+		const familyDir = this.resolveWithin(this.mappingsDir, family);
+		const mappingFile = this.resolveWithin(
 			familyDir,
 			`${controlId.replace(/[^a-zA-Z0-9-]/g, '_')}-mappings.yaml`
 		);
@@ -589,6 +646,11 @@ export class FileStore {
 				}
 			} catch (error) {
 				console.error(`Error processing mapping file ${file}:`, error);
+				// Surface the failure so callers do not update caches or report
+				// success for a delete that never happened
+				throw new Error(
+					`Failed to delete mapping in ${file}: ${error instanceof Error ? error.message : String(error)}`
+				);
 			}
 		}
 	}
@@ -644,9 +706,10 @@ export class FileStore {
 
 		// Save each control's mappings
 		for (const [controlId, controlMappings] of mappingsByControl) {
+			this.assertValidControlId(controlId);
 			const family = this.getControlFamily(controlId);
-			const familyDir = join(this.mappingsDir, family);
-			const mappingFile = join(
+			const familyDir = this.resolveWithin(this.mappingsDir, family);
+			const mappingFile = this.resolveWithin(
 				familyDir,
 				`${controlId.replace(/[^a-zA-Z0-9-]/g, '_')}-mappings.yaml`
 			);

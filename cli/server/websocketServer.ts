@@ -85,13 +85,20 @@ class WebSocketManager {
 						const existingControl = state.controlsCache.get(payload.id as string);
 						if (!existingControl) {
 							console.error('Control not found:', payload.id);
+							ws.send(
+								JSON.stringify({
+									type: 'error',
+									payload: { message: `Control not found: ${payload.id}` }
+								})
+							);
 							return;
 						}
 
 						// Merge partial update with existing control (payload contains only changed fields)
 						const updatedControl = { ...existingControl, ...payload } as Control;
 
-						// Save the merged control
+						// Save the merged control - if this throws, the cache is left
+						// untouched and the outer handler reports the error to the client
 						await state.fileStore.saveControl(updatedControl);
 
 						// Update just this control in the cache
