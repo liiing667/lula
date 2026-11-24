@@ -896,6 +896,63 @@ export function formatMappingEntry(mapping: any): string {
 	return finalJustification;
 }
 
+// ---------------------------------------------------------------------------
+// Spreadsheet formula injection protection
+//
+// Control values are stored as plain text in YAML, but spreadsheet
+// applications interpret cell values that start with `=`, `+`, `-` or `@` as
+// formulas when a CSV/XLSX export is opened. To keep values such as
+// `=HYPERLINK(...)`, `+cmd` or `@SUM` visible as text (and prevent formula
+// injection), CSV/XLSX exports prefix dangerous values with a single quote.
+// JSON exports and the UI are untouched so the original values remain
+// traceable. Negative numbers, dates and plain `@` descriptions must not be
+// treated as formulas.
+// ---------------------------------------------------------------------------
+
+// Lotus-style formulas such as `@SUM` or `@HYPERLINK(...)`: an `@` followed by
+// at least two uppercase letters/digits/underscores. Plain descriptions like
+// `@user` or `@ mention` do not match.
+const AT_FORMULA_PATTERN = /^@[A-Z][A-Z0-9_]{1,}(?=\(|\b)/;
+
+// Plain numeric values (including negative numbers and exponents) so they are
+// never mistaken for formulas.
+const NUMERIC_VALUE_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+// Determine whether a value would be interpreted as a formula by spreadsheet
+// applications when an exported CSV/XLSX file is opened.
+export function isFormulaLike(value: unknown): boolean {
+	if (typeof value !== 'string' || value.length === 0) {
+		return false;
+	}
+
+	const firstChar = value.charAt(0);
+
+	if (firstChar === '=') {
+		return true;
+	}
+
+	if (firstChar === '+' || firstChar === '-') {
+		// Negative/positive numbers (e.g. "-42", "+1.5") are not formulas.
+		return !NUMERIC_VALUE_PATTERN.test(value.trim());
+	}
+
+	if (firstChar === '@') {
+		// Only function-like values (@SUM, @HYPERLINK(...)) are formulas;
+		// plain "@user" descriptions are left alone.
+		return AT_FORMULA_PATTERN.test(value);
+	}
+
+	return false;
+}
+
+// Escape a string value for CSV/XLSX export so spreadsheet applications render
+// it as visible text instead of evaluating it as a formula. The leading single
+// quote is the standard text-marker understood by Excel and other spreadsheet
+// applications; the original value is never modified.
+export function escapeFormulaValue(value: string): string {
+	return isFormulaLike(value) ? `'${value}` : value;
+}
+
 // Export as CSV
 function exportAsCSV(
 	controls: any[],
@@ -907,7 +964,7 @@ function exportAsCSV(
 }
 
 // Export as CSV with column mapping support
-function exportAsCSVWithMapping(
+export function exportAsCSVWithMapping(
 	controls: any[],
 	metadata: any,
 	columnMappings: Record<string, string>,
@@ -1053,12 +1110,13 @@ function exportAsCSVWithMapping(
 			if (fieldName === 'mappings' && Array.isArray(value)) {
 				// Format mappings as a readable string with justifications
 				const mappingsStr = value.map((m: any) => formatMappingEntry(m)).join('\n\n');
-				return `"${mappingsStr.replace(/"/g, '""')}"`;
+				return `"${escapeFormulaValue(mappingsStr).replace(/"/g, '""')}"`;
 			}
 
-			if (Array.isArray(value)) return `"${value.join('; ').replace(/"/g, '""')}"`;
+			if (Array.isArray(value))
+				return `"${escapeFormulaValue(value.join('; ')).replace(/"/g, '""')}"`;
 			if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
-			return `"${String(value).replace(/"/g, '""')}"`;
+			return `"${escapeFormulaValue(String(value)).replace(/"/g, '""')}"`;
 		});
 		csvRows.push(row.join(','));
 	});
@@ -1082,7 +1140,7 @@ async function exportAsExcel(
 }
 
 // Export as Excel with column mapping support
-async function exportAsExcelWithMapping(
+export async function exportAsExcelWithMapping(
 	controls: any[],
 	metadata: any,
 	columnMappings: Record<string, string>,
@@ -1214,13 +1272,14 @@ async function exportAsExcelWithMapping(
 			// Special handling for mappings field when it's a dedicated mappings column
 			if (fieldName === 'mappings' && Array.isArray(value)) {
 				const mappingsStr = value.map((m: any) => formatMappingEntry(m)).join('\n\n');
-				exportControl[displayName] = mappingsStr;
+				exportControl[displayName] = escapeFormulaValue(mappingsStr);
 			} else if (Array.isArray(value)) {
-				exportControl[displayName] = value.join('; ');
+				exportControl[displayName] = escapeFormulaValue(value.join('; '));
 			} else if (typeof value === 'object' && value !== null) {
 				exportControl[displayName] = JSON.stringify(value);
 			} else {
-				exportControl[displayName] = value;
+				exportControl[displayName] =
+					typeof value === 'string' ? escapeFormulaValue(value) : value;
 			}
 		});
 
@@ -1262,7 +1321,7 @@ async function exportAsExcelWithMapping(
 }
 
 // Export as JSON
-function exportAsJSON(controls: any[], metadata: any, res: express.Response) {
+export function exportAsJSON(controls: any[], metadata: any, res: express.Response) {
 	const exportData = {
 		metadata: metadata || {},
 		controlCount: controls.length,
@@ -1404,7 +1463,16 @@ router.post('/export-csv', async (req, res) => {
 		debug(`Exporting ${controlsWithMappings.length} controls as ${format} with column mappings`);
 
 		// Use custom export function with column mapping
-		return exportAsCSVWithMapping(controlsWithMappings, metadata, columnMappings, res);
+		switch (String(format).toLowerCase()) {
+			case 'excel':
+			case 'xlsx':
+				return await exportAsExcelWithMapping(controlsWithMappings, metadata, columnMappings, res);
+			case 'json':
+				return exportAsJSON(controlsWithMappings, metadata, res);
+			case 'csv':
+			default:
+				return exportAsCSVWithMapping(controlsWithMappings, metadata, columnMappings, res);
+		}
 	} catch (error: any) {
 		console.error('Export error:', error);
 		res.status(500).json({ error: error.message });

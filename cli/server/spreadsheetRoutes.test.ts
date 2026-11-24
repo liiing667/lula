@@ -47,19 +47,40 @@ vi.mock('./serverState', () => ({
 	getServerState: mockGetServerState
 }));
 
-const { mockXLSXRead, mockXLSXSheetToJson } = vi.hoisted(() => ({
+const {
+	mockXLSXRead,
+	mockXLSXSheetToJson,
+	mockXLSXJsonToSheet,
+	mockXLSXBookNew,
+	mockXLSXBookAppendSheet,
+	mockXLSXWrite
+} = vi.hoisted(() => ({
 	mockXLSXRead: vi.fn(),
-	mockXLSXSheetToJson: vi.fn()
+	mockXLSXSheetToJson: vi.fn(),
+	mockXLSXJsonToSheet: vi.fn(),
+	mockXLSXBookNew: vi.fn(),
+	mockXLSXBookAppendSheet: vi.fn(),
+	mockXLSXWrite: vi.fn()
 }));
 
 vi.mock('xlsx-republish', () => ({
 	read: mockXLSXRead,
+	write: mockXLSXWrite,
 	utils: {
-		sheet_to_json: mockXLSXSheetToJson
+		sheet_to_json: mockXLSXSheetToJson,
+		json_to_sheet: mockXLSXJsonToSheet,
+		book_new: mockXLSXBookNew,
+		book_append_sheet: mockXLSXBookAppendSheet
 	},
 	default: {
 		read: mockXLSXRead,
-		utils: { sheet_to_json: mockXLSXSheetToJson }
+		write: mockXLSXWrite,
+		utils: {
+			sheet_to_json: mockXLSXSheetToJson,
+			json_to_sheet: mockXLSXJsonToSheet,
+			book_new: mockXLSXBookNew,
+			book_append_sheet: mockXLSXBookAppendSheet
+		}
 	}
 }));
 
@@ -106,7 +127,12 @@ import {
 	detectValueType,
 	parseCSV,
 	extractFamilyFromControlId,
-	formatMappingEntry
+	formatMappingEntry,
+	isFormulaLike,
+	escapeFormulaValue,
+	exportAsCSVWithMapping,
+	exportAsExcelWithMapping,
+	exportAsJSON
 } from './spreadsheetRoutes';
 import type { ImportParameters } from './spreadsheetRoutes';
 import { getServerState } from './serverState';
@@ -236,6 +262,252 @@ describe('spreadsheetRoutes', () => {
 			const mapping = {};
 			const result = formatMappingEntry(mapping);
 			expect(result).toBe('[Unknown]');
+		});
+	});
+
+	describe('formula injection protection', () => {
+		const createMockResponse = () => {
+			const res: any = {
+				setHeader: vi.fn(),
+				send: vi.fn(),
+				json: vi.fn(),
+				status: vi.fn()
+			};
+			res.status.mockReturnValue(res);
+			return res;
+		};
+
+		const formulaControls = () => [
+			{
+				id: 'AC-1',
+				family: 'AC',
+				title: '=HYPERLINK("http://evil.example","click me")',
+				command: '+cmd /c calc',
+				score: '-50',
+				date: '2023-01-01',
+				note: '@user please review this',
+				summary: '@SUM(A1:A10)'
+			}
+		];
+
+		const exportMetadata = () => ({
+			name: 'TestSet',
+			control_id_field: 'id',
+			fieldSchema: { fields: {} }
+		});
+
+		describe('isFormulaLike', () => {
+			it('should detect formulas starting with =', () => {
+				expect(isFormulaLike('=HYPERLINK("http://evil.example","click")')).toBe(true);
+				expect(isFormulaLike('=1+1')).toBe(true);
+				expect(isFormulaLike('=')).toBe(true);
+			});
+
+			it('should detect formulas starting with + or - that are not numbers', () => {
+				expect(isFormulaLike('+cmd /c calc')).toBe(true);
+				expect(isFormulaLike('-cmd')).toBe(true);
+				expect(isFormulaLike('+SUM(A1)')).toBe(true);
+			});
+
+			it('should detect Lotus-style @ formulas', () => {
+				expect(isFormulaLike('@SUM')).toBe(true);
+				expect(isFormulaLike('@SUM(A1:A10)')).toBe(true);
+				expect(isFormulaLike('@HYPERLINK("http://evil.example")')).toBe(true);
+			});
+
+			it('should not flag negative or positive numbers', () => {
+				expect(isFormulaLike('-123')).toBe(false);
+				expect(isFormulaLike('-1.5')).toBe(false);
+				expect(isFormulaLike('-0.5')).toBe(false);
+				expect(isFormulaLike('+42')).toBe(false);
+				expect(isFormulaLike('-1e3')).toBe(false);
+			});
+
+			it('should not flag dates', () => {
+				expect(isFormulaLike('2023-01-01')).toBe(false);
+				expect(isFormulaLike('12/31/2023')).toBe(false);
+			});
+
+			it('should not flag plain @ descriptions', () => {
+				expect(isFormulaLike('@user please review this')).toBe(false);
+				expect(isFormulaLike('@ mention someone')).toBe(false);
+				expect(isFormulaLike('@User')).toBe(false);
+			});
+
+			it('should not flag regular text, empty values or non-strings', () => {
+				expect(isFormulaLike('AC-1')).toBe(false);
+				expect(isFormulaLike('Access control policy')).toBe(false);
+				expect(isFormulaLike('')).toBe(false);
+				expect(isFormulaLike(null)).toBe(false);
+				expect(isFormulaLike(undefined)).toBe(false);
+				expect(isFormulaLike(123)).toBe(false);
+			});
+		});
+
+		describe('escapeFormulaValue', () => {
+			it('should prefix formula-like values with a single quote', () => {
+				expect(escapeFormulaValue('=HYPERLINK("http://x","y")')).toBe(
+					'\'=HYPERLINK("http://x","y")'
+				);
+				expect(escapeFormulaValue('+cmd /c calc')).toBe("'+cmd /c calc");
+				expect(escapeFormulaValue('@SUM(A1:A10)')).toBe("'@SUM(A1:A10)");
+			});
+
+			it('should leave safe values untouched', () => {
+				expect(escapeFormulaValue('-50')).toBe('-50');
+				expect(escapeFormulaValue('2023-01-01')).toBe('2023-01-01');
+				expect(escapeFormulaValue('@user please review this')).toBe(
+					'@user please review this'
+				);
+				expect(escapeFormulaValue('AC-1')).toBe('AC-1');
+			});
+		});
+
+		describe('exportAsCSVWithMapping', () => {
+			it('should escape formula-like values so they are visible text', () => {
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				exportAsCSVWithMapping(controls, exportMetadata(), {}, res);
+
+				expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'text/csv');
+				const csv = res.send.mock.calls[0][0] as string;
+				expect(csv).toContain("'=HYPERLINK");
+				expect(csv).toContain("'+cmd /c calc");
+				expect(csv).toContain("'@SUM(A1:A10)");
+			});
+
+			it('should not escape negative numbers, dates or plain @ descriptions', () => {
+				const res = createMockResponse();
+
+				exportAsCSVWithMapping(formulaControls(), exportMetadata(), {}, res);
+
+				const csv = res.send.mock.calls[0][0] as string;
+				expect(csv).toContain('"-50"');
+				expect(csv).not.toContain("'-50");
+				expect(csv).toContain('"2023-01-01"');
+				expect(csv).toContain('"@user please review this"');
+				expect(csv).not.toContain("'@user");
+			});
+
+			it('should escape formula-like mapping justifications', () => {
+				const res = createMockResponse();
+				const controls = [
+					{
+						id: 'AC-1',
+						family: 'AC',
+						mappings: [{ description: '=cmd /c calc', status: 'Satisfied', cci: '' }]
+					}
+				];
+
+				exportAsCSVWithMapping(controls, exportMetadata(), { mappings: 'Mappings' }, res);
+
+				const csv = res.send.mock.calls[0][0] as string;
+				expect(csv).toContain("'=cmd /c calc");
+			});
+
+			it('should not mutate the original control objects', () => {
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				exportAsCSVWithMapping(controls, exportMetadata(), {}, res);
+
+				expect(controls[0].title).toBe('=HYPERLINK("http://evil.example","click me")');
+				expect(controls[0].command).toBe('+cmd /c calc');
+				expect(controls[0].summary).toBe('@SUM(A1:A10)');
+			});
+
+			it('should not write to disk when the export fails', () => {
+				const res = createMockResponse();
+				res.send.mockImplementation(() => {
+					throw new Error('response failed');
+				});
+				const controls = formulaControls();
+
+				expect(() => exportAsCSVWithMapping(controls, exportMetadata(), {}, res)).toThrow(
+					'response failed'
+				);
+				expect(mockWriteFileSync).not.toHaveBeenCalled();
+				expect(mockMkdirSync).not.toHaveBeenCalled();
+				expect(controls[0].title).toBe('=HYPERLINK("http://evil.example","click me")');
+			});
+		});
+
+		describe('exportAsExcelWithMapping', () => {
+			beforeEach(() => {
+				mockXLSXBookNew.mockReturnValue({ SheetNames: [], Sheets: {} });
+				mockXLSXJsonToSheet.mockImplementation((data: any) => ({ __data: data }));
+				mockXLSXWrite.mockReturnValue(Buffer.from('fake-xlsx'));
+			});
+
+			it('should escape formula-like values in the worksheet data', async () => {
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				await exportAsExcelWithMapping(controls, exportMetadata(), {}, res);
+
+				const worksheetData = mockXLSXJsonToSheet.mock.calls[0][0] as any[];
+				expect(worksheetData[0]['Title']).toBe(
+					'\'=HYPERLINK("http://evil.example","click me")'
+				);
+				expect(worksheetData[0]['Command']).toBe("'+cmd /c calc");
+				expect(worksheetData[0]['Summary']).toBe("'@SUM(A1:A10)");
+			});
+
+			it('should not escape negative numbers, dates or plain @ descriptions', async () => {
+				const res = createMockResponse();
+
+				await exportAsExcelWithMapping(formulaControls(), exportMetadata(), {}, res);
+
+				const worksheetData = mockXLSXJsonToSheet.mock.calls[0][0] as any[];
+				expect(worksheetData[0]['Score']).toBe('-50');
+				expect(worksheetData[0]['Date']).toBe('2023-01-01');
+				expect(worksheetData[0]['Note']).toBe('@user please review this');
+			});
+
+			it('should send the generated workbook without modifying the controls', async () => {
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				await exportAsExcelWithMapping(controls, exportMetadata(), {}, res);
+
+				expect(res.setHeader).toHaveBeenCalledWith(
+					'Content-Type',
+					'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+				);
+				expect(res.send).toHaveBeenCalledWith(Buffer.from('fake-xlsx'));
+				expect(controls[0].title).toBe('=HYPERLINK("http://evil.example","click me")');
+			});
+
+			it('should not write to disk when workbook generation fails', async () => {
+				mockXLSXWrite.mockImplementation(() => {
+					throw new Error('workbook generation failed');
+				});
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				await expect(
+					exportAsExcelWithMapping(controls, exportMetadata(), {}, res)
+				).rejects.toThrow('workbook generation failed');
+				expect(mockWriteFileSync).not.toHaveBeenCalled();
+				expect(mockMkdirSync).not.toHaveBeenCalled();
+				expect(controls[0].title).toBe('=HYPERLINK("http://evil.example","click me")');
+			});
+		});
+
+		describe('exportAsJSON', () => {
+			it('should keep the original values so they remain traceable', () => {
+				const res = createMockResponse();
+				const controls = formulaControls();
+
+				exportAsJSON(controls, exportMetadata(), res);
+
+				expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/json');
+				const payload = res.json.mock.calls[0][0] as any;
+				expect(payload.controls[0].title).toBe('=HYPERLINK("http://evil.example","click me")');
+				expect(payload.controls[0].command).toBe('+cmd /c calc');
+				expect(payload.controls[0].summary).toBe('@SUM(A1:A10)');
+			});
 		});
 	});
 
