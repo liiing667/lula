@@ -1141,7 +1141,31 @@ describe('GitHistoryUtil', () => {
 					message: 'Already up to date.\n'
 				});
 				expect(outputExec).toHaveBeenCalledWith(
-					expect.stringMatching(/^git pull origin main$/),
+					'git',
+					['pull', 'origin', 'main'],
+					expect.objectContaining({ cwd: '/repo/root', encoding: 'utf8' })
+				);
+			});
+
+			it('should pass remote and branch as argv without a shell', async () => {
+				const outputExec = vi.fn(() => 'Already up to date.\n');
+				const gitHistoryUtil = new GitHistoryUtil('/repo/root', outputExec);
+
+				vi.spyOn(gitHistoryUtil, 'isGitRepository').mockResolvedValue(true);
+				vi.spyOn(gitHistoryUtil, 'getCurrentBranch').mockResolvedValue('main');
+
+				const mockedGit = (await import('isomorphic-git')) as any;
+				mockedGit.findRoot.mockResolvedValue('/repo/root');
+				mockedGit.listRemotes = vi.fn().mockResolvedValue([
+					{ remote: 'origin; touch /tmp/pwned', url: 'git@example:repo.git' }
+				]);
+
+				await gitHistoryUtil.pullChanges();
+
+				// The malicious remote name must be a single argv element, never a shell string
+				expect(outputExec).toHaveBeenCalledWith(
+					'git',
+					['pull', 'origin; touch /tmp/pwned', 'main'],
 					expect.objectContaining({ cwd: '/repo/root', encoding: 'utf8' })
 				);
 			});
@@ -1166,7 +1190,7 @@ describe('GitHistoryUtil', () => {
 			it('should handle pull errors', async () => {
 				const mockConsoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-				// execSync that simulates a failing `git pull`
+				// execFileSync that simulates a failing `git pull`
 				const failingExec = vi.fn(() => {
 					const err: any = new Error('Network error');
 					err.stderr = Buffer.from('Network error');
@@ -1197,6 +1221,67 @@ describe('GitHistoryUtil', () => {
 				);
 
 				mockConsoleError.mockRestore();
+			});
+		});
+
+		describe('fetchFromRemotes', () => {
+			it('should fetch each remote through the shell-free boundary', async () => {
+				const outputExec = vi.fn(() => '');
+				const gitHistoryUtil = new GitHistoryUtil('/repo/root', outputExec);
+
+				vi.spyOn(gitHistoryUtil, 'isGitRepository').mockResolvedValue(true);
+
+				const mockedGit = (await import('isomorphic-git')) as any;
+				mockedGit.findRoot.mockResolvedValue('/repo/root');
+				mockedGit.listRemotes = vi.fn().mockResolvedValue([
+					{ remote: 'origin', url: 'git@example:repo.git' },
+					{ remote: 'upstream; touch /tmp/pwned', url: 'git@example:other.git' }
+				]);
+
+				const result = await gitHistoryUtil.fetchFromRemotes();
+
+				expect(result.success).toBe(true);
+				expect(outputExec).toHaveBeenCalledWith(
+					'git',
+					['fetch', 'origin'],
+					expect.objectContaining({ cwd: '/repo/root', encoding: 'utf8' })
+				);
+				// The semicolon-bearing remote name is a single argv element, not shell syntax
+				expect(outputExec).toHaveBeenCalledWith(
+					'git',
+					['fetch', 'upstream; touch /tmp/pwned'],
+					expect.objectContaining({ cwd: '/repo/root', encoding: 'utf8' })
+				);
+			});
+
+			it('should preserve partial failures when one remote fails', async () => {
+				const mixedExec = vi.fn((_file: string, args: string[]) => {
+					if (args[1] === 'bad-remote') {
+						const err: any = new Error('Command failed');
+						err.stderr = Buffer.from('fatal: bad-remote does not appear to be a git repository');
+						throw err;
+					}
+					return '';
+				});
+				const gitHistoryUtil = new GitHistoryUtil('/repo/root', mixedExec);
+
+				vi.spyOn(gitHistoryUtil, 'isGitRepository').mockResolvedValue(true);
+
+				const mockedGit = (await import('isomorphic-git')) as any;
+				mockedGit.findRoot.mockResolvedValue('/repo/root');
+				mockedGit.listRemotes = vi.fn().mockResolvedValue([
+					{ remote: 'origin', url: 'git@example:repo.git' },
+					{ remote: 'bad-remote', url: 'git@example:missing.git' }
+				]);
+
+				const result = await gitHistoryUtil.fetchFromRemotes();
+
+				expect(result.success).toBe(false);
+				expect(result.message).toBe('Fetch completed with some errors');
+				expect(result.details).toEqual([
+					'Fetched from origin',
+					'Failed to fetch from bad-remote: fatal: bad-remote does not appear to be a git repository'
+				]);
 			});
 		});
 	});

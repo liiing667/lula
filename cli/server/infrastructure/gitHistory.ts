@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as git from 'isomorphic-git';
 import { relative } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { createYamlDiff, type YamlDiffResult } from './yamlDiff';
 
 /**
@@ -73,23 +73,28 @@ export interface GitStatus {
 
 export class GitHistoryUtil {
 	private baseDir: string;
-	private execSync: typeof execSync;
+	private execFileSync: typeof execFileSync;
 
-	constructor(baseDir: string, execSyncFn?: typeof execSync) {
+	constructor(baseDir: string, execFileSyncFn?: typeof execFileSync) {
 		this.baseDir = baseDir;
-		this.execSync = execSyncFn || execSync;
+		this.execFileSync = execFileSyncFn || execFileSync;
 	}
 
 	/**
-	 * Execute a git command using native git binary with credentials support
+	 * Execute a git command using the native git binary with credentials support.
+	 *
+	 * This is the single execution boundary for all git subprocesses (fetch, pull,
+	 * git-status refreshes). Arguments are passed as an argv array directly to the
+	 * git binary without a shell, so values sourced from the repo config (remote
+	 * names, branch names) are never reinterpreted as shell syntax.
 	 */
 	private async executeGitCommand(
-		command: string,
+		args: string[],
 		cwd?: string
 	): Promise<{ success: boolean; output: string; error?: string }> {
 		try {
 			const workingDir = cwd || (await git.findRoot({ fs, filepath: process.cwd() }));
-			const output = this.execSync(command, {
+			const output = this.execFileSync('git', args, {
 				cwd: workingDir,
 				encoding: 'utf8',
 				stdio: ['pipe', 'pipe', 'pipe']
@@ -585,7 +590,7 @@ export class GitHistoryUtil {
 				// Try to fetch from each remote individually to handle auth issues gracefully
 				for (const remote of remotes) {
 					try {
-						const fetchResult = await this.executeGitCommand(`git fetch ${remote.remote}`, gitRoot);
+						const fetchResult = await this.executeGitCommand(['fetch', remote.remote], gitRoot);
 						if (!fetchResult.success) {
 							console.warn(`Could not fetch from remote ${remote.remote}:`, fetchResult.error);
 						}
@@ -687,7 +692,7 @@ export class GitHistoryUtil {
 
 			for (const remote of remotes) {
 				try {
-					const fetchResult = await this.executeGitCommand(`git fetch ${remote.remote}`, gitRoot);
+					const fetchResult = await this.executeGitCommand(['fetch', remote.remote], gitRoot);
 					if (fetchResult.success) {
 						details.push(`Fetched from ${remote.remote}`);
 					} else {
@@ -740,8 +745,10 @@ export class GitHistoryUtil {
 			}
 			// pull from the first remote
 			const targetRemote = remotes[0].remote;
-			const pullCommand = `git pull ${targetRemote} ${currentBranch}`;
-			const pullResult = await this.executeGitCommand(pullCommand, gitRoot);
+			const pullResult = await this.executeGitCommand(
+				['pull', targetRemote, currentBranch],
+				gitRoot
+			);
 
 			if (!pullResult.success) {
 				return {
