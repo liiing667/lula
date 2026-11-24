@@ -29,6 +29,37 @@ export interface PullRequestFile {
 }
 const closingBody = `\n\n---\n\n<sub>**Tip:** Customize your compliance reviews with <a href="https://github.com/defenseunicorns/lula.git" class="Link--inTextBlock" target="_blank" rel="noopener noreferrer">Lula</a>.</sub>`;
 export const LULA_SIGNATURE = '<!-- LULA_SIGNATURE:v1 -->';
+/**
+ * Marker present in Lula posts created before the versioned signature existed.
+ * Kept so those legacy posts are still recognized (and migrated/cleaned up).
+ */
+export const LEGACY_LULA_MARKER = '## Lula Compliance Overview';
+
+/**
+ * Determine whether a comment or review was authored by Lula.
+ *
+ * Lula posts through a GitHub App/bot identity, so an object is only treated
+ * as Lula-authored when it carries a Lula marker (current or legacy) AND was
+ * created by a bot/app account. This prevents Lula from deleting human
+ * comments that merely quote the marker.
+ *
+ * @param body - The body of the comment or review.
+ * @param user - The author of the comment or review.
+ * @returns True if the object is a Lula-authored post, false otherwise.
+ */
+export function isLulaAuthored(
+	body: string | null | undefined,
+	user: { login?: string | null; type?: string | null } | null | undefined
+): boolean {
+	const content = body ?? '';
+	const hasMarker = content.includes(LULA_SIGNATURE) || content.includes(LEGACY_LULA_MARKER);
+	if (!hasMarker) return false;
+
+	const login = user?.login ?? '';
+	const type = user?.type ?? '';
+	return type === 'Bot' || login.endsWith('[bot]');
+}
+
 // Add a post mode union for future expansion
 type PostMode = 'review' | 'comment';
 
@@ -710,7 +741,12 @@ export function crawlCommand(): Command {
 
 			const analysisResult = await performComplianceAnalysis(context);
 
-			await cleanupOldPosts(context, opts.postMode);
+			// A cleanup failure must never suppress the current finding.
+			try {
+				await cleanupOldPosts(context, opts.postMode);
+			} catch (err) {
+				console.error(`Error cleaning up old Lula ${opts.postMode} posts: ${err}`);
+			}
 
 			if (analysisResult.hasFindings) {
 				const finalBody = analysisResult.commentBody + closingBody;
@@ -741,7 +777,11 @@ export async function deleteOldIssueComments({
 	repo: string;
 	pull_number: number;
 }): Promise<void> {
+	const commentIds: number[] = [];
 	let page = 1;
+
+	// Collect every Lula-authored comment across all pages before deleting so
+	// that deletions do not shift pagination and skip comments.
 	while (true) {
 		const { data: comments } = await octokit.issues.listComments({
 			owner,
@@ -753,13 +793,15 @@ export async function deleteOldIssueComments({
 		if (!comments.length) break;
 
 		for (const c of comments) {
-			const hasSignature = (c.body ?? '').includes(LULA_SIGNATURE);
-			if (hasSignature) {
-				await octokit.issues.deleteComment({ owner, repo, comment_id: c.id });
-				break;
+			if (isLulaAuthored(c.body, c.user)) {
+				commentIds.push(c.id);
 			}
 		}
 		page++;
+	}
+
+	for (const comment_id of commentIds) {
+		await octokit.issues.deleteComment({ owner, repo, comment_id });
 	}
 }
 
@@ -774,7 +816,11 @@ export async function deleteOldReviewComments({
 	repo: string;
 	pull_number: number;
 }): Promise<void> {
+	const commentIds: number[] = [];
 	let page = 1;
+
+	// Collect every Lula-authored review comment across all pages before
+	// deleting so that deletions do not shift pagination and skip comments.
 	while (true) {
 		const { data: reviewComments } = await octokit.pulls.listReviewComments({
 			owner,
@@ -786,13 +832,15 @@ export async function deleteOldReviewComments({
 		if (!reviewComments.length) break;
 
 		for (const rc of reviewComments) {
-			const hasSignature = (rc.body ?? '').includes(LULA_SIGNATURE);
-			if (hasSignature) {
-				await octokit.pulls.deleteReviewComment({ owner, repo, comment_id: rc.id });
-				break;
+			if (isLulaAuthored(rc.body, rc.user)) {
+				commentIds.push(rc.id);
 			}
 		}
 		page++;
+	}
+
+	for (const comment_id of commentIds) {
+		await octokit.pulls.deleteReviewComment({ owner, repo, comment_id });
 	}
 }
 
@@ -807,7 +855,11 @@ export async function dismissOldReviews({
 	repo: string;
 	pull_number: number;
 }): Promise<void> {
+	const reviewIds: number[] = [];
 	let page = 1;
+
+	// Collect every Lula-authored review across all pages before dismissing so
+	// that dismissals do not shift pagination and skip reviews.
 	while (true) {
 		const { data: reviews } = await octokit.pulls.listReviews({
 			owner,
@@ -819,20 +871,22 @@ export async function dismissOldReviews({
 		if (!reviews.length) break;
 
 		for (const r of reviews) {
-			const hasSignature = (r.body ?? '').includes(LULA_SIGNATURE);
 			const isAlreadyDismissed = r.state === 'DISMISSED';
 
-			if (hasSignature && !isAlreadyDismissed) {
-				await octokit.pulls.dismissReview({
-					owner,
-					repo,
-					pull_number,
-					review_id: r.id,
-					message: 'Superseded by a new Lula compliance review.'
-				});
-				break;
+			if (!isAlreadyDismissed && isLulaAuthored(r.body, r.user)) {
+				reviewIds.push(r.id);
 			}
 		}
 		page++;
+	}
+
+	for (const review_id of reviewIds) {
+		await octokit.pulls.dismissReview({
+			owner,
+			repo,
+			pull_number,
+			review_id,
+			message: 'Superseded by a new Lula compliance review.'
+		});
 	}
 }

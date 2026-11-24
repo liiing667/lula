@@ -18,7 +18,9 @@ import {
 	dismissOldReviews,
 	containsLulaAnnotations,
 	findOptimalPairings,
-	LULA_SIGNATURE
+	isLulaAuthored,
+	LULA_SIGNATURE,
+	LEGACY_LULA_MARKER
 } from './crawl';
 
 vi.mock('fs', () => {
@@ -1238,14 +1240,52 @@ describe('getRemovedBlocks', () => {
 });
 
 describe('cleanup helpers', () => {
-	it('deleteOldIssueComments deletes only the first signed comment per page', async () => {
+	const botUser = { login: 'lula[bot]', type: 'Bot' };
+	const humanUser = { login: 'octocat', type: 'User' };
+
+	it('deleteOldIssueComments deletes every Lula-bot comment across all pages', async () => {
 		const octokit = new Octokit();
 		issuesListComments
 			.mockResolvedValueOnce({
 				data: [
-					{ id: 1, body: `${LULA_SIGNATURE}\nSigned A` },
-					{ id: 2, body: 'Not signed' },
-					{ id: 3, body: `${LULA_SIGNATURE}\nSigned B` }
+					{ id: 1, body: `${LULA_SIGNATURE}\nSigned A`, user: botUser },
+					{ id: 2, body: 'Not signed', user: botUser },
+					{ id: 3, body: `${LULA_SIGNATURE}\nSigned B`, user: botUser }
+				]
+			})
+			.mockResolvedValueOnce({
+				data: [{ id: 4, body: `${LULA_SIGNATURE}\nSigned C`, user: botUser }]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldIssueComments({ octokit, owner: 'o', repo: 'r', pull_number: 7 });
+
+		expect(issuesListComments).toHaveBeenCalledTimes(3);
+		expect(issuesDeleteComment).toHaveBeenCalledTimes(3);
+		expect(issuesDeleteComment).toHaveBeenNthCalledWith(1, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 1
+		});
+		expect(issuesDeleteComment).toHaveBeenNthCalledWith(2, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 3
+		});
+		expect(issuesDeleteComment).toHaveBeenNthCalledWith(3, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 4
+		});
+	});
+
+	it('deleteOldIssueComments preserves human comments that copy the signature', async () => {
+		const octokit = new Octokit();
+		issuesListComments
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 1, body: `${LULA_SIGNATURE}\nCopied by a human`, user: humanUser },
+					{ id: 2, body: `${LULA_SIGNATURE}\nFrom the bot`, user: botUser }
 				]
 			})
 			.mockResolvedValueOnce({ data: [] });
@@ -1253,22 +1293,79 @@ describe('cleanup helpers', () => {
 		await deleteOldIssueComments({ octokit, owner: 'o', repo: 'r', pull_number: 7 });
 
 		expect(issuesDeleteComment).toHaveBeenCalledTimes(1);
-		expect(issuesDeleteComment).toHaveBeenNthCalledWith(1, {
+		expect(issuesDeleteComment).toHaveBeenCalledWith({
+			owner: 'o',
+			repo: 'r',
+			comment_id: 2
+		});
+	});
+
+	it('deleteOldIssueComments migrates legacy markers posted before the signature existed', async () => {
+		const octokit = new Octokit();
+		issuesListComments
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 1, body: `${LEGACY_LULA_MARKER}\nlegacy post`, user: botUser },
+					{ id: 2, body: `${LEGACY_LULA_MARKER}\nquoted by a human`, user: humanUser }
+				]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldIssueComments({ octokit, owner: 'o', repo: 'r', pull_number: 7 });
+
+		expect(issuesDeleteComment).toHaveBeenCalledTimes(1);
+		expect(issuesDeleteComment).toHaveBeenCalledWith({
 			owner: 'o',
 			repo: 'r',
 			comment_id: 1
 		});
 	});
 
-	it('deleteOldReviewComments deletes only the first signed review comment per page', async () => {
+	it('deleteOldReviewComments deletes every Lula-bot review comment across all pages', async () => {
 		const octokit = new Octokit();
 
 		pullsListReviewComments
 			.mockResolvedValueOnce({
 				data: [
-					{ id: 11, body: `${LULA_SIGNATURE}\nRC A` },
-					{ id: 12, body: 'other' },
-					{ id: 13, body: `${LULA_SIGNATURE}\nRC B` }
+					{ id: 11, body: `${LULA_SIGNATURE}\nRC A`, user: botUser },
+					{ id: 12, body: 'other', user: botUser },
+					{ id: 13, body: `${LULA_SIGNATURE}\nRC B`, user: botUser }
+				]
+			})
+			.mockResolvedValueOnce({
+				data: [{ id: 14, body: `${LULA_SIGNATURE}\nRC C`, user: botUser }]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldReviewComments({ octokit, owner: 'o', repo: 'r', pull_number: 8 });
+
+		expect(pullsListReviewComments).toHaveBeenCalledTimes(3);
+		expect(pullsDeleteReviewComment).toHaveBeenCalledTimes(3);
+		expect(pullsDeleteReviewComment).toHaveBeenNthCalledWith(1, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 11
+		});
+		expect(pullsDeleteReviewComment).toHaveBeenNthCalledWith(2, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 13
+		});
+		expect(pullsDeleteReviewComment).toHaveBeenNthCalledWith(3, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 14
+		});
+	});
+
+	it('deleteOldReviewComments preserves human review comments that copy the signature', async () => {
+		const octokit = new Octokit();
+
+		pullsListReviewComments
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 11, body: `${LULA_SIGNATURE}\nhuman copy`, user: humanUser },
+					{ id: 12, body: `${LULA_SIGNATURE}\nbot comment`, user: botUser }
 				]
 			})
 			.mockResolvedValueOnce({ data: [] });
@@ -1276,29 +1373,33 @@ describe('cleanup helpers', () => {
 		await deleteOldReviewComments({ octokit, owner: 'o', repo: 'r', pull_number: 8 });
 
 		expect(pullsDeleteReviewComment).toHaveBeenCalledTimes(1);
-		expect(pullsDeleteReviewComment).toHaveBeenNthCalledWith(1, {
+		expect(pullsDeleteReviewComment).toHaveBeenCalledWith({
 			owner: 'o',
 			repo: 'r',
-			comment_id: 11
+			comment_id: 12
 		});
 	});
 
-	it('dismissOldReviews dismisses only the first signed review per page (handles null bodies)', async () => {
+	it('dismissOldReviews dismisses every Lula-bot review across all pages (handles null bodies)', async () => {
 		const octokit = new Octokit();
 		pullsListReviews
 			.mockResolvedValueOnce({
 				data: [
-					{ id: 21, body: `${LULA_SIGNATURE}\nReview A` },
-					{ id: 22, body: null },
-					{ id: 23, body: 'not signed' },
-					{ id: 24, body: `${LULA_SIGNATURE}\nReview B` }
+					{ id: 21, body: `${LULA_SIGNATURE}\nReview A`, user: botUser },
+					{ id: 22, body: null, user: botUser },
+					{ id: 23, body: 'not signed', user: botUser },
+					{ id: 24, body: `${LULA_SIGNATURE}\nReview B`, user: botUser }
 				]
+			})
+			.mockResolvedValueOnce({
+				data: [{ id: 25, body: `${LULA_SIGNATURE}\nReview C`, user: botUser }]
 			})
 			.mockResolvedValueOnce({ data: [] });
 
 		await dismissOldReviews({ octokit, owner: 'o', repo: 'r', pull_number: 9 });
 
-		expect(pullsDismissReview).toHaveBeenCalledTimes(1);
+		expect(pullsListReviews).toHaveBeenCalledTimes(3);
+		expect(pullsDismissReview).toHaveBeenCalledTimes(3);
 		expect(pullsDismissReview).toHaveBeenNthCalledWith(1, {
 			owner: 'o',
 			repo: 'r',
@@ -1306,6 +1407,75 @@ describe('cleanup helpers', () => {
 			review_id: 21,
 			message: 'Superseded by a new Lula compliance review.'
 		});
+		expect(pullsDismissReview).toHaveBeenNthCalledWith(2, {
+			owner: 'o',
+			repo: 'r',
+			pull_number: 9,
+			review_id: 24,
+			message: 'Superseded by a new Lula compliance review.'
+		});
+		expect(pullsDismissReview).toHaveBeenNthCalledWith(3, {
+			owner: 'o',
+			repo: 'r',
+			pull_number: 9,
+			review_id: 25,
+			message: 'Superseded by a new Lula compliance review.'
+		});
+	});
+
+	it('dismissOldReviews preserves human reviews and already-dismissed reviews', async () => {
+		const octokit = new Octokit();
+		pullsListReviews
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 21, body: `${LULA_SIGNATURE}\nhuman review`, user: humanUser, state: 'CHANGES_REQUESTED' },
+					{ id: 22, body: `${LULA_SIGNATURE}\nold bot review`, user: botUser, state: 'DISMISSED' },
+					{ id: 23, body: `${LULA_SIGNATURE}\nactive bot review`, user: botUser, state: 'CHANGES_REQUESTED' }
+				]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await dismissOldReviews({ octokit, owner: 'o', repo: 'r', pull_number: 9 });
+
+		expect(pullsDismissReview).toHaveBeenCalledTimes(1);
+		expect(pullsDismissReview).toHaveBeenCalledWith({
+			owner: 'o',
+			repo: 'r',
+			pull_number: 9,
+			review_id: 23,
+			message: 'Superseded by a new Lula compliance review.'
+		});
+	});
+});
+
+describe('isLulaAuthored', () => {
+	const botUser = { login: 'lula[bot]', type: 'Bot' };
+	const appUser = { login: 'github-actions[bot]', type: 'Bot' };
+	const humanUser = { login: 'octocat', type: 'User' };
+
+	it('accepts bot/app authors carrying the current signature', () => {
+		expect(isLulaAuthored(`${LULA_SIGNATURE}\nbody`, botUser)).toBe(true);
+		expect(isLulaAuthored(`${LULA_SIGNATURE}\nbody`, appUser)).toBe(true);
+	});
+
+	it('accepts bot authors carrying only the legacy marker', () => {
+		expect(isLulaAuthored(`${LEGACY_LULA_MARKER}\nlegacy body`, botUser)).toBe(true);
+	});
+
+	it('rejects human authors even when they copy the marker', () => {
+		expect(isLulaAuthored(`${LULA_SIGNATURE}\ncopied`, humanUser)).toBe(false);
+		expect(isLulaAuthored(`${LEGACY_LULA_MARKER}\ncopied`, humanUser)).toBe(false);
+	});
+
+	it('rejects bot authors without a Lula marker', () => {
+		expect(isLulaAuthored('just a normal bot comment', botUser)).toBe(false);
+	});
+
+	it('rejects missing bodies and missing users', () => {
+		expect(isLulaAuthored(null, botUser)).toBe(false);
+		expect(isLulaAuthored(undefined, botUser)).toBe(false);
+		expect(isLulaAuthored(`${LULA_SIGNATURE}\nbody`, null)).toBe(false);
+		expect(isLulaAuthored(`${LULA_SIGNATURE}\nbody`, undefined)).toBe(false);
 	});
 });
 
@@ -1459,7 +1629,15 @@ describe('crawl command (integration)', () => {
 		});
 
 		issuesListComments
-			.mockResolvedValueOnce({ data: [{ id: 99, body: `${LULA_SIGNATURE}\nold content` }] })
+			.mockResolvedValueOnce({
+				data: [
+					{
+						id: 99,
+						body: `${LULA_SIGNATURE}\nold content`,
+						user: { login: 'lula[bot]', type: 'Bot' }
+					}
+				]
+			})
 			.mockResolvedValueOnce({ data: [] });
 
 		const command = crawlCommand();
@@ -1523,11 +1701,27 @@ describe('crawl command (integration)', () => {
 		});
 
 		pullsListReviewComments
-			.mockResolvedValueOnce({ data: [{ id: 55, body: '<!-- LULA_SIGNATURE:v1 -->\nline cmt' }] })
+			.mockResolvedValueOnce({
+				data: [
+					{
+						id: 55,
+						body: '<!-- LULA_SIGNATURE:v1 -->\nline cmt',
+						user: { login: 'lula[bot]', type: 'Bot' }
+					}
+				]
+			})
 			.mockResolvedValueOnce({ data: [] }); // end pages
 
 		pullsListReviews
-			.mockResolvedValueOnce({ data: [{ id: 66, body: '<!-- LULA_SIGNATURE:v1 -->\nreview' }] })
+			.mockResolvedValueOnce({
+				data: [
+					{
+						id: 66,
+						body: '<!-- LULA_SIGNATURE:v1 -->\nreview',
+						user: { login: 'lula[bot]', type: 'Bot' }
+					}
+				]
+			})
 			.mockResolvedValueOnce({ data: [] });
 
 		const command = crawlCommand();
@@ -1581,8 +1775,6 @@ describe('crawl command (integration)', () => {
 		});
 
 		issuesListComments.mockResolvedValueOnce({ data: [] });
-		pullsListReviewComments.mockResolvedValueOnce({ data: [] });
-		pullsListReviews.mockResolvedValueOnce({ data: [] });
 
 		const command = crawlCommand();
 		await command.parseAsync(['--post-mode', 'comment'], { from: 'user' });
@@ -1593,6 +1785,94 @@ describe('crawl command (integration)', () => {
 
 		expect(issuesCreateComment).not.toHaveBeenCalled();
 		expect(pullsCreateReview).not.toHaveBeenCalled();
+	});
+
+	it('comment mode: cleanup failure does not suppress the current finding', async () => {
+		process.env.OWNER = 'octo-org';
+		process.env.REPO = 'octo-repo';
+		process.env.PULL_NUMBER = '66';
+		process.env.GITHUB_TOKEN = 'test-token';
+
+		pullsGet.mockResolvedValueOnce({
+			data: { head: { ref: 'feat', sha: 'feat-sha' }, base: { sha: 'base-sha-abc' } }
+		});
+		pullsListFiles.mockResolvedValueOnce({ data: [{ filename: 'x.txt', status: 'modified' }] });
+
+		const uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+		const oldText = ['a', `// @lulaStart ${uuid}`, 'old', `// @lulaEnd ${uuid}`, 'z'].join('\n');
+		const newText = ['a', `// @lulaStart ${uuid}`, 'new', `// @lulaEnd ${uuid}`, 'z'].join('\n');
+
+		reposGetContent.mockImplementation(({ path, ref }) => {
+			if (path === 'x.txt' && ref === 'base-sha-abc') return Promise.resolve({ data: oldText });
+			if (path === 'x.txt' && ref === 'feat-sha') return Promise.resolve({ data: newText });
+			throw new Error('unexpected getContent');
+		});
+
+		// Cleanup blows up partway through (second page of comments fails).
+		issuesListComments
+			.mockResolvedValueOnce({
+				data: [
+					{
+						id: 98,
+						body: `${LULA_SIGNATURE}\nold content`,
+						user: { login: 'lula[bot]', type: 'Bot' }
+					}
+				]
+			})
+			.mockRejectedValueOnce(new Error('GitHub API unavailable'));
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'comment'], { from: 'user' });
+
+		expect(errSpy).toHaveBeenCalledWith(
+			'Error cleaning up old Lula comment posts: Error: GitHub API unavailable'
+		);
+
+		// The finding is still posted despite the cleanup failure.
+		expect(issuesCreateComment).toHaveBeenCalledTimes(1);
+		const call = issuesCreateComment.mock.calls[0][0];
+		expect(call.issue_number).toBe(66);
+		expect(call.body).toContain('## Lula Compliance Overview');
+		expect(call.body).toContain('x.txt');
+	});
+
+	it('review mode: cleanup failure does not suppress the current finding', async () => {
+		process.env.OWNER = 'octo-org';
+		process.env.REPO = 'octo-repo';
+		process.env.PULL_NUMBER = '55';
+		process.env.GITHUB_TOKEN = 'test-token';
+
+		pullsGet.mockResolvedValueOnce({
+			data: { head: { ref: 'feat', sha: 'feat-sha' }, base: { sha: 'base-sha-abc' } }
+		});
+		pullsListFiles.mockResolvedValueOnce({ data: [{ filename: 'x.txt', status: 'modified' }] });
+
+		const uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+		const oldText = ['a', `// @lulaStart ${uuid}`, 'old', `// @lulaEnd ${uuid}`, 'z'].join('\n');
+		const newText = ['a', `// @lulaStart ${uuid}`, 'new', `// @lulaEnd ${uuid}`, 'z'].join('\n');
+
+		reposGetContent.mockImplementation(({ path, ref }) => {
+			if (path === 'x.txt' && ref === 'base-sha-abc') return Promise.resolve({ data: oldText });
+			if (path === 'x.txt' && ref === 'feat-sha') return Promise.resolve({ data: newText });
+			throw new Error('unexpected getContent');
+		});
+
+		// Dismissing old reviews fails partway through cleanup.
+		pullsListReviews.mockRejectedValueOnce(new Error('GitHub API unavailable'));
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'review'], { from: 'user' });
+
+		expect(errSpy).toHaveBeenCalledWith(
+			'Error cleaning up old Lula review posts: Error: GitHub API unavailable'
+		);
+
+		// The finding is still posted despite the cleanup failure.
+		expect(pullsCreateReview).toHaveBeenCalledTimes(1);
+		const call = pullsCreateReview.mock.calls[0][0];
+		expect(call.pull_number).toBe(55);
+		expect(call.event).toBe('REQUEST_CHANGES');
+		expect(call.body).toContain('## Lula Compliance Overview');
 	});
 });
 
