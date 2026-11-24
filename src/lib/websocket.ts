@@ -61,6 +61,69 @@ export const appState = writable<AppState>({
 	isConnected: false
 });
 
+const DEV_API_PORT = 3000;
+const isDevWebPort = (port: string): boolean => {
+	const value = Number(port);
+	return (
+		(Number.isInteger(value) && value >= 5173 && value <= 5183) ||
+		(value >= 4173 && value <= 4183)
+	);
+};
+
+function normalizeHostname(hostname: string): string {
+	let value = hostname.trim().toLowerCase();
+	if (value.startsWith('[') && value.endsWith(']')) {
+		value = value.slice(1, -1);
+	}
+	return value;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+	const value = normalizeHostname(hostname);
+	if (!value) {
+		return false;
+	}
+	if (value === 'localhost' || value.endsWith('.localhost')) {
+		return true;
+	}
+	if (value === '::1') {
+		return true;
+	}
+	const parts = value.split('.');
+	if (parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part))) {
+		return parts[0] === '127';
+	}
+	return false;
+}
+
+function formatHostnameForUrl(hostname: string): string {
+	const value = normalizeHostname(hostname);
+	return value.includes(':') ? `[${value}]` : value;
+}
+
+/**
+ * Build the WebSocket URL for the current page.
+ *
+ * During development the Svelte app is served by Vite on 5173 while the API
+ * (and WebSocket endpoint) lives on 3000.  Keep that split for every loopback
+ * spelling (localhost, 127.0.0.1, [::1]) instead of special-casing only the
+ * literal string "localhost".
+ */
+export function getWebSocketUrl(
+	location: Pick<Location, 'protocol' | 'hostname' | 'host' | 'port'>
+): string {
+	const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+	let pagePort = location.port;
+	if (!pagePort) {
+		const hostPort = /:(\d+)$/.exec(location.host);
+		pagePort = hostPort ? hostPort[1] : '';
+	}
+	if (isLoopbackHostname(location.hostname) && isDevWebPort(pagePort)) {
+		return `${protocol}//${formatHostnameForUrl(location.hostname)}:${DEV_API_PORT}/ws`;
+	}
+	return `${protocol}//${location.host}/ws`;
+}
+
 class WebSocketClient {
 	private ws: WebSocket | null = null;
 	private reconnectTimer: number | null = null;
@@ -80,11 +143,8 @@ class WebSocketClient {
 			return;
 		}
 
-		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		// In development, WebSocket is on port 3000, not the dev server port
-		const host =
-			browser && window.location.hostname === 'localhost' ? 'localhost:3000' : window.location.host;
-		const wsUrl = `${protocol}//${host}/ws`;
+		// In development, WebSocket is on port 3000, not the dev server port.
+		const wsUrl = getWebSocketUrl(window.location);
 
 		console.log('Connecting to WebSocket:', wsUrl);
 

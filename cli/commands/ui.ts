@@ -6,10 +6,12 @@ import { existsSync } from 'fs';
 import open from 'open';
 import { join } from 'path';
 import { startServer } from '../server';
+import { formatHostForUrl } from '../server/connectionSecurity';
 
 export interface UIOptions {
 	dir: string;
 	port: number;
+	host?: string;
 	openBrowser?: boolean;
 }
 
@@ -25,6 +27,7 @@ export class UICommand {
 			.description('Start the Lula web interface (default)')
 			.option('--dir <directory>', 'Control set directory path')
 			.option('--port <port>', 'Server port', '3000')
+			.option('--host <address>', 'Loopback address to bind (127.0.0.1 or ::1)')
 			.option('--no-open-browser', 'Do not open browser when starting the server')
 			.action(async (options) => {
 				// Set debug mode if flag is present from parent command
@@ -39,24 +42,25 @@ export class UICommand {
 				await uiCommand.run({
 					dir: controlSetDir,
 					port: parseInt(options.port),
+					host: options.host,
 					openBrowser: options.openBrowser !== false // Default to true unless explicitly disabled
 				});
 			});
 	}
 
 	async run(options: UIOptions): Promise<void> {
-		const { dir, port, openBrowser } = options;
+		const { dir, port, host, openBrowser } = options;
 
 		// Check if lula.yaml exists in the directory
 		const controlSetPath = join(dir, 'lula.yaml');
 		const hasControlSet = existsSync(controlSetPath);
 
 		// Start server with wizard mode if no control set exists
-		await startServer({ controlSetDir: dir, port });
+		await startServer(host ? { controlSetDir: dir, port, host } : { controlSetDir: dir, port });
 
 		// Open browser if requested
 		if (openBrowser) {
-			const url = `http://localhost:${port}`;
+			const url = `http://${formatHostForUrl(host ?? 'localhost')}:${port}`;
 			if (!hasControlSet) {
 				// Open directly to the setup wizard
 				await open(`${url}/setup`);

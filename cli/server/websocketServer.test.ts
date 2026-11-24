@@ -196,10 +196,13 @@ describe('websocketServer', () => {
 		describe('initialize', () => {
 			it('should create WebSocketServer with correct configuration', () => {
 				wsManager.initialize(mockServer);
-				expect(mockWebSocketServer).toHaveBeenCalledWith({
-					server: mockServer,
-					path: '/ws'
-				});
+				expect(mockWebSocketServer).toHaveBeenCalledWith(
+					expect.objectContaining({
+						server: mockServer,
+						path: '/ws',
+						verifyClient: expect.any(Function)
+					})
+				);
 			});
 
 			it('should set up connection event handler', () => {
@@ -236,6 +239,60 @@ describe('websocketServer', () => {
 				}
 
 				expect(mockWs.send).toHaveBeenCalledWith(JSON.stringify({ type: 'connected' }));
+			});
+
+			it('rejects a handshake from a non-loopback origin', () => {
+				wsManager.initialize(mockServer);
+
+				const options = mockWebSocketServer.mock.calls[0][0] as {
+					verifyClient: (
+						info: {
+							origin?: string;
+							req?: {
+								headers?: Record<string, string>;
+								socket?: { remoteAddress?: string };
+							};
+						},
+						callback: (allowed: boolean, code?: number, message?: string) => void
+					) => void;
+				};
+				const callback = vi.fn();
+
+				options.verifyClient(
+					{
+						origin: 'http://evil.example',
+						req: {
+							headers: { host: 'localhost:3000', origin: 'http://evil.example' },
+							socket: { remoteAddress: '127.0.0.1' }
+						}
+					},
+					callback
+				);
+
+				expect(callback).toHaveBeenCalledWith(false, 403, 'Forbidden');
+			});
+
+			it('does not register or send state to an unauthorized connection', () => {
+				wsManager.initialize(mockServer);
+
+				const connectionHandler = mockWss.on.mock.calls.find(
+					(call: unknown[]) => call[0] === 'connection'
+				)?.[1] as Function;
+				const unauthorizedWs = {
+					send: vi.fn(),
+					on: vi.fn(),
+					close: vi.fn(),
+					readyState: WS_OPEN
+				};
+
+				connectionHandler(unauthorizedWs, {
+					headers: { host: 'localhost:3000', origin: 'http://evil.example' },
+					socket: { remoteAddress: '127.0.0.1' }
+				});
+
+				expect(unauthorizedWs.close).toHaveBeenCalledWith(1008, 'Forbidden');
+				expect(unauthorizedWs.send).not.toHaveBeenCalled();
+				expect(unauthorizedWs.on).not.toHaveBeenCalled();
 			});
 		});
 

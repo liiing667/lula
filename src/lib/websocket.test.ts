@@ -9,7 +9,7 @@ vi.mock('$app/environment', () => ({
 }));
 
 import type { Control, Mapping, SourceEntry } from './types';
-import { appState, type AppState } from './websocket';
+import { appState, getWebSocketUrl, type AppState } from './websocket';
 
 class MockWebSocket {
 	url: string;
@@ -81,6 +81,25 @@ describe('WebSocket Client', () => {
 	});
 
 	describe('Connection Management', () => {
+		it('builds the dev URL for IPv4 and IPv6 loopback pages', () => {
+			expect(
+				getWebSocketUrl({
+					protocol: 'http:',
+					hostname: '127.0.0.1',
+					host: '127.0.0.1:5173',
+					port: '5173'
+				})
+			).toBe('ws://127.0.0.1:3000/ws');
+			expect(
+				getWebSocketUrl({
+					protocol: 'http:',
+					hostname: '[::1]',
+					host: '[::1]:5173',
+					port: '5173'
+				})
+			).toBe('ws://[::1]:3000/ws');
+		});
+
 		it('should connect to WebSocket with correct URL', () => {
 			wsClient.connect();
 

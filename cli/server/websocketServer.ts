@@ -7,16 +7,24 @@
  */
 
 import { readFileSync } from 'fs';
-import { Server } from 'http';
+import { IncomingMessage, Server } from 'http';
 import * as yaml from 'js-yaml';
 import crypto from 'node:crypto';
 import { join } from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { debug } from '../utils/debug';
+import {
+	ConnectionPolicy,
+	ConnectionPolicyOptions,
+	createConnectionPolicy,
+	isAllowedRequest
+} from './connectionSecurity';
 import { getControlId } from './infrastructure/controlHelpers';
 import { GitHistoryUtil } from './infrastructure/gitHistory';
 import { getCurrentControlSetPath, getServerState } from './serverState';
 import type { Control, Mapping } from './types';
+
+export * from './connectionSecurity';
 
 /**
  * WebSocket message types for client-server communication
@@ -66,6 +74,51 @@ interface ControlSetMetadata {
 class WebSocketManager {
 	private wss: WebSocketServer | null = null;
 	private clients: Set<WebSocket> = new Set();
+	private connectionPolicy: ConnectionPolicy | null = null;
+
+	/**
+	 * The HTTP server and the WebSocket server must use the same policy object.
+	 * `createServer()` attaches it to the HTTP server before initializing us, so
+	 * both transports evaluate the exact same bound address/port/origin rules.
+	 */
+	private resolveConnectionPolicy(
+		server: Server,
+		override?: ConnectionPolicy | ConnectionPolicyOptions
+	): ConnectionPolicy {
+		if (override) {
+			return override instanceof ConnectionPolicy
+				? override
+				: createConnectionPolicy(override);
+		}
+		const attached = (server as unknown as { __lulaConnectionPolicy?: ConnectionPolicy })
+			.__lulaConnectionPolicy;
+		if (attached) {
+			return attached;
+		}
+		if (this.connectionPolicy) {
+			return this.connectionPolicy;
+		}
+		return createConnectionPolicy({});
+	}
+
+	public setConnectionPolicy(policy: ConnectionPolicy | ConnectionPolicyOptions): void {
+		this.connectionPolicy =
+			policy instanceof ConnectionPolicy ? policy : createConnectionPolicy(policy);
+	}
+
+	/**
+	 * Authorize a WebSocket handshake/connection.  Missing requests are treated
+	 * as trusted only for compatibility with direct unit-level invocation; a
+	 * real `ws` connection always supplies the HTTP upgrade request.
+	 */
+	private isConnectionAllowed(request?: IncomingMessage | null): boolean {
+		if (!request) {
+			return true;
+		}
+		const policy = this.connectionPolicy ?? createConnectionPolicy({});
+		this.connectionPolicy = policy;
+		return isAllowedRequest(request, policy);
+	}
 
 	/**
 	 * Handle incoming commands from WebSocket clients
@@ -779,10 +832,51 @@ class WebSocketManager {
 	 * Initialize the WebSocket server
 	 * @param server - The HTTP server to attach to
 	 */
-	initialize(server: Server): void {
-		this.wss = new WebSocketServer({ server, path: '/ws' });
+	initialize(server: Server, policy?: ConnectionPolicy | ConnectionPolicyOptions): void {
+		this.connectionPolicy = this.resolveConnectionPolicy(server, policy);
 
-		this.wss.on('connection', (ws: WebSocket) => {
+		const options = {
+			server,
+			path: '/ws',
+			verifyClient: (
+				info: { origin?: string; req?: IncomingMessage },
+				callback: (allowed: boolean, code?: number, message?: string) => void
+			): void => {
+				const request =
+					info.req ??
+					(info.origin
+						? ({ headers: { origin: info.origin } } as unknown as IncomingMessage)
+						: undefined);
+				if (this.isConnectionAllowed(request)) {
+					callback(true);
+				} else {
+					callback(false, 403, 'Forbidden');
+				}
+			}
+		} as {
+			server: Server;
+			path: string;
+			verifyClient?: (
+				info: { origin?: string; req?: IncomingMessage },
+				callback: (allowed: boolean, code?: number, message?: string) => void
+			) => void;
+		};
+
+		this.wss = new WebSocketServer(
+			options as unknown as ConstructorParameters<typeof WebSocketServer>[0]
+		);
+
+		this.wss.on('connection', (ws: WebSocket, request?: IncomingMessage) => {
+			if (!this.isConnectionAllowed(request)) {
+				debug('Rejected WebSocket connection from an untrusted origin');
+				try {
+					ws.close(1008, 'Forbidden');
+				} catch {
+					// The handshake may already be gone; nothing else to do.
+				}
+				return;
+			}
+
 			debug('New WebSocket client connected');
 			this.clients.add(ws);
 

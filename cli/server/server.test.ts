@@ -23,7 +23,7 @@ type ExpressFactory = (() => ExpressAppMock) & {
 	static: (dir: string) => unknown;
 };
 
-type ListenFn = (port: number, cb: () => void) => void;
+type ListenFn = (port: number, host: string, cb: () => void) => void;
 
 type StdinRW = {
 	isTTY?: boolean;
@@ -45,7 +45,7 @@ const h = vi.hoisted(() => {
 		expressJson: vi.fn<(opts: { limit: string }) => unknown>(),
 		expressStatic: vi.fn<(dir: string) => unknown>(),
 
-		cors: vi.fn<() => unknown>(() => 'cors-mw'),
+		cors: vi.fn<(options?: unknown) => unknown>(() => 'cors-mw'),
 		rateLimit: vi.fn<(_: { windowMs: number; max: number }) => unknown>(() => 'limiter-mw'),
 
 		httpListen: mockServer.listen,
@@ -53,6 +53,7 @@ const h = vi.hoisted(() => {
 
 		initializeServerState: vi.fn<(dir: string) => void>(),
 		loadAllData: vi.fn<() => Promise<void>>(),
+		resetServerState: vi.fn<() => void>(),
 		saveMappingsToFile: vi.fn<() => Promise<void>>(),
 
 		spreadsheetRoutes: vi.fn<() => unknown>(() => 'routes-mw'),
@@ -108,6 +109,7 @@ vi.mock('http', async (importOriginal) => {
 vi.mock('./serverState', () => ({
 	initializeServerState: h.initializeServerState,
 	loadAllData: h.loadAllData,
+	resetServerState: h.resetServerState,
 	saveMappingsToFile: h.saveMappingsToFile
 }));
 
@@ -140,7 +142,7 @@ describe('server', () => {
 		h.existsSync.mockReturnValue(true); // By default, directories exist
 		h.mkdirSync.mockImplementation(() => undefined); // Mock mkdir to do nothing
 
-		h.httpListen.mockImplementation((_port: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_port: number, _host: string, cb: () => void) => cb());
 		h.loadAllData.mockResolvedValue(undefined);
 		logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined as unknown as void);
 		vi.spyOn(process, 'on').mockImplementation(((
@@ -199,7 +201,7 @@ describe('server', () => {
 			throw new Error('exit');
 		});
 
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _h: string, cb: () => void) => cb());
 		await startServer({ controlSetDir: '/ctrl', port: 3040 });
 		const escErr = new Error('boom-esc');
 		h.saveMappingsToFile.mockRejectedValueOnce(escErr);
@@ -223,7 +225,7 @@ describe('server', () => {
 			throw new Error('exit');
 		});
 
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _h: string, cb: () => void) => cb());
 		await startServer({ controlSetDir: '/ctrl', port: 3041 });
 
 		const sigErr = new Error('boom-sigint');
@@ -246,7 +248,7 @@ describe('server', () => {
 		const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
 			throw new Error('exit');
 		});
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _h: string, cb: () => void) => cb());
 
 		await startServer({ controlSetDir: '/ctrl', port: 3050 });
 
@@ -262,11 +264,12 @@ describe('server', () => {
 		h.existsSync.mockReturnValue(true);
 
 		const srv = await createServer({ controlSetDir: '/ctrl', port: 4321 });
-		expect(h.existsSync).toHaveBeenCalledWith('/ctrl');
+		expect(h.existsSync).not.toHaveBeenCalled();
 		expect(h.mkdirSync).not.toHaveBeenCalled();
 
-		expect(h.initializeServerState).toHaveBeenCalledWith('/ctrl');
-		expect(h.loadAllData).toHaveBeenCalledTimes(1);
+		// State is not created until the listening address is bound successfully.
+		expect(h.initializeServerState).not.toHaveBeenCalled();
+		expect(h.loadAllData).not.toHaveBeenCalled();
 
 		expect(h.cors).toHaveBeenCalled();
 		expect(h.expressUse).toHaveBeenCalledWith('cors-mw');
@@ -274,10 +277,36 @@ describe('server', () => {
 		expect(h.expressJson).toHaveBeenCalledWith({ limit: '50mb' });
 		expect(h.expressUse).toHaveBeenCalledWith('json-mw');
 
-		expect(h.rateLimit).toHaveBeenCalledWith({
-			windowMs: 15 * 60 * 1000,
-			max: 200
-		});
+		expect(h.rateLimit).toHaveBeenCalledWith(
+			expect.objectContaining({
+				windowMs: 15 * 60 * 1000,
+				max: 200,
+				keyGenerator: expect.any(Function)
+			})
+		);
+		const rateLimitOptions = h.rateLimit.mock.calls[0]?.[0] as unknown as {
+			keyGenerator: (request: unknown) => string;
+		};
+		expect(
+			rateLimitOptions.keyGenerator({
+				headers: { 'x-forwarded-for': '203.0.113.9' },
+				socket: { remoteAddress: '127.0.0.1' }
+			})
+		).toBe('127.0.0.1');
+
+		const corsOptions = h.cors.mock.calls[0]?.[0] as unknown as {
+			origin: (origin: string | undefined, callback: (err: unknown, allowed?: boolean) => void) => void;
+		};
+		const evilCors = vi.fn();
+		corsOptions.origin('http://evil.example', evilCors);
+		expect(evilCors).toHaveBeenCalledWith(null, false);
+		const localCors = vi.fn();
+		corsOptions.origin('http://localhost:4321', localCors);
+		expect(localCors).toHaveBeenCalledWith(null, true);
+		const devCors = vi.fn();
+		corsOptions.origin('http://127.0.0.1:5173', devCors);
+		expect(devCors).toHaveBeenCalledWith(null, true);
+
 		expect(h.expressUse).toHaveBeenCalledWith('limiter-mw');
 
 		expect(h.expressStatic).toHaveBeenCalled();
@@ -302,14 +331,19 @@ describe('server', () => {
 		);
 
 		await srv.start();
-		expect(h.httpListen).toHaveBeenCalledWith(4321, expect.any(Function));
+		expect(h.httpListen).toHaveBeenCalledWith(4321, '127.0.0.1', expect.any(Function));
+		expect(h.existsSync).toHaveBeenCalledWith('/ctrl');
+		expect(h.mkdirSync).not.toHaveBeenCalled();
+		expect(h.initializeServerState).toHaveBeenCalledWith('/ctrl');
+		expect(h.loadAllData).toHaveBeenCalledTimes(1);
 		expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/http:\/\/localhost:4321/));
 	});
 
 	it('createServer creates the directory if missing', async () => {
 		h.existsSync.mockReturnValue(false);
 
-		await createServer({ controlSetDir: '/newdir', port: 9999 });
+		const srv = await createServer({ controlSetDir: '/newdir', port: 9999 });
+		await srv.start();
 
 		expect(h.existsSync).toHaveBeenCalledWith('/newdir');
 		expect(h.mkdirSync).toHaveBeenCalledWith('/newdir', { recursive: true });
@@ -321,7 +355,7 @@ describe('server', () => {
 		});
 
 		h.saveMappingsToFile.mockResolvedValue(undefined);
-		h.httpListen.mockImplementation((_port: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_port: number, _host: string, cb: () => void) => cb());
 
 		await startServer({ controlSetDir: '/ctrl', port: 3000 });
 
@@ -347,5 +381,28 @@ describe('server', () => {
 		expect(exitSpy).toHaveBeenCalledWith(0);
 
 		exitSpy.mockRestore();
+	});
+
+	it('does not create write state when the bind fails', async () => {
+		h.httpListen.mockImplementation(() => {
+			throw new Error('EADDRINUSE');
+		});
+
+		await expect(startServer({ controlSetDir: '/ctrl', port: 3060 })).rejects.toThrow(
+			'EADDRINUSE'
+		);
+
+		expect(h.initializeServerState).not.toHaveBeenCalled();
+		expect(h.loadAllData).not.toHaveBeenCalled();
+		expect(h.resetServerState).toHaveBeenCalled();
+	});
+
+	it('rejects non-loopback listen addresses before binding', async () => {
+		await expect(
+			createServer({ controlSetDir: '/ctrl', port: 3061, host: '0.0.0.0' })
+		).rejects.toThrow(/non-loopback/);
+
+		expect(h.httpListen).not.toHaveBeenCalled();
+		expect(h.initializeServerState).not.toHaveBeenCalled();
 	});
 });

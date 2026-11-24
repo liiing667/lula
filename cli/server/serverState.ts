@@ -50,6 +50,19 @@ export function getServerState(): CLIServerState {
 	return serverState;
 }
 
+/**
+ * Drop all in-memory state.  Used when a server fails before it has finished
+ * binding/initializing so a failed start cannot leave a half-live writer
+ * behind.  A later successful start creates a brand new state object.
+ */
+export function resetServerState(): void {
+	serverState = undefined;
+}
+
+export function isServerStateInitialized(): boolean {
+	return serverState !== undefined;
+}
+
 export function getCurrentControlSetPath(): string {
 	const state = getServerState();
 	return state.currentSubdir === '.'
