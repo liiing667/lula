@@ -18,6 +18,7 @@ import {
 	dismissOldReviews,
 	containsLulaAnnotations,
 	findOptimalPairings,
+	extractMapBlocksWithDiagnostics,
 	LULA_SIGNATURE
 } from './crawl';
 
@@ -427,6 +428,139 @@ describe('extractMapBlocks & getChangedBlocks', () => {
 		// (even though it's now in first position)
 		expect(changed[0].startLine).toBe(0);
 		expect(changed[0].endLine).toBe(3);
+	});
+});
+
+describe('extractMapBlocks identity and malformed-marker handling', () => {
+	const uuid = '123e4567-e89b-12d3-a456-426614174000';
+	const otherUuid = '987fcdeb-51a2-43d1-b789-456789012345';
+
+	it('keeps full identity for nested blocks sharing the same UUID (LIFO pairing)', () => {
+		const text = [
+			'header',
+			`// @lulaStart ${uuid}`,
+			'outer body',
+			`// @lulaStart ${uuid}`,
+			'inner body',
+			`// @lulaEnd ${uuid}`,
+			'outer tail',
+			`// @lulaEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const blocks = extractMapBlocks(text);
+		expect(blocks).toHaveLength(2);
+
+		// Blocks are returned in source order with stable occurrence identities.
+		expect(blocks[0]).toMatchObject({ uuid, occurrence: 0, startLine: 1, endLine: 8 });
+		expect(blocks[1]).toMatchObject({ uuid, occurrence: 1, startLine: 3, endLine: 6 });
+	});
+
+	it('assigns distinct occurrence numbers to repeated UUID blocks', () => {
+		const text = [
+			`// @lulaStart ${uuid}`,
+			'first',
+			`// @lulaEnd ${uuid}`,
+			`// @lulaStart ${uuid}`,
+			'second',
+			`// @lulaEnd ${uuid}`
+		].join('\n');
+
+		const blocks = extractMapBlocks(text);
+		expect(blocks.map((b) => b.occurrence)).toEqual([0, 1]);
+		expect(blocks.every((b) => b.uuid === uuid)).toBe(true);
+	});
+
+	it('reports an unclosed @lulaStart as malformed instead of fabricating a block', () => {
+		const text = ['header', `// @lulaStart ${uuid}`, 'orphan body', 'footer'].join('\n');
+
+		const { blocks, malformed } = extractMapBlocksWithDiagnostics(text);
+		expect(blocks).toHaveLength(0);
+		expect(malformed).toHaveLength(1);
+		expect(malformed[0]).toMatchObject({ uuid, line: 1, kind: 'unclosed-start' });
+	});
+
+	it('reports an @lulaEnd without a matching start as malformed', () => {
+		const text = ['header', `// @lulaEnd ${uuid}`, 'footer'].join('\n');
+
+		const { blocks, malformed } = extractMapBlocksWithDiagnostics(text);
+		expect(blocks).toHaveLength(0);
+		expect(malformed).toHaveLength(1);
+		expect(malformed[0]).toMatchObject({ uuid, line: 1, kind: 'unmatched-end' });
+	});
+
+	it('pairs crossed UUIDs against their own matching start marker', () => {
+		const text = [
+			`// @lulaStart ${uuid}`,
+			`// @lulaStart ${otherUuid}`,
+			'body',
+			`// @lulaEnd ${uuid}`,
+			`// @lulaEnd ${otherUuid}`
+		].join('\n');
+
+		const { blocks, malformed } = extractMapBlocksWithDiagnostics(text);
+		expect(malformed).toHaveLength(0);
+		expect(blocks).toHaveLength(2);
+		expect(blocks.map((b) => b.uuid).sort()).toEqual([otherUuid, uuid].sort());
+		// Each block keeps the line range of its own UUID marker, not its neighbor's.
+		expect(blocks.find((b) => b.uuid === uuid)).toMatchObject({ startLine: 0, endLine: 4 });
+		expect(blocks.find((b) => b.uuid === otherUuid)).toMatchObject({ startLine: 1, endLine: 5 });
+	});
+
+	it('detects removal of one block when several share the same UUID', () => {
+		const oldText = [
+			`// @lulaStart ${uuid}`,
+			'block A content',
+			`// @lulaEnd ${uuid}`,
+			'',
+			`// @lulaStart ${uuid}`,
+			'block B content',
+			`// @lulaEnd ${uuid}`
+		].join('\n');
+		const newText = [`// @lulaStart ${uuid}`, 'block A content', `// @lulaEnd ${uuid}`].join('\n');
+
+		const removed = getRemovedBlocks(oldText, newText);
+		expect(removed).toHaveLength(1);
+		expect(removed[0].uuid).toBe(uuid);
+	});
+
+	it('does not treat an in-place content edit as a removal', () => {
+		const oldText = [`// @lulaStart ${uuid}`, 'old content', `// @lulaEnd ${uuid}`].join('\n');
+		const newText = [`// @lulaStart ${uuid}`, 'new content', `// @lulaEnd ${uuid}`].join('\n');
+
+		expect(getRemovedBlocks(oldText, newText)).toHaveLength(0);
+		expect(getChangedBlocks(oldText, newText)).toHaveLength(1);
+	});
+
+	it('never reports a purely added block as a change and never duplicates a finding', () => {
+		const oldText = [`// @lulaStart ${uuid}`, 'kept content', `// @lulaEnd ${uuid}`].join('\n');
+		const newText = [
+			`// @lulaStart ${uuid}`,
+			'kept content',
+			`// @lulaEnd ${uuid}`,
+			'',
+			`// @lulaStart ${uuid}`,
+			'brand new content',
+			`// @lulaEnd ${uuid}`
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newText);
+		expect(changed).toHaveLength(0);
+
+		// Two genuinely modified same-UUID blocks must produce two distinct findings.
+		const oldTwo = [
+			`// @lulaStart ${uuid}`, 'A', `// @lulaEnd ${uuid}`,
+			`// @lulaStart ${uuid}`, 'B', `// @lulaEnd ${uuid}`
+		].join('\n');
+		const newTwo = [
+			`// @lulaStart ${uuid}`, 'A2', `// @lulaEnd ${uuid}`,
+			`// @lulaStart ${uuid}`, 'B2', `// @lulaEnd ${uuid}`
+		].join('\n');
+		const findings = getChangedBlocks(oldTwo, newTwo);
+		const identities = new Set(
+			findings.map((b) => `${b.uuid}:${b.occurrence}:${b.startLine}:${b.endLine}`)
+		);
+		expect(identities.size).toBe(findings.length);
 	});
 });
 

@@ -143,42 +143,124 @@ export async function fetchRawFileViaAPI({
 }
 
 /**
- * Extracts all @lulaStart and @lulaEnd blocks from the given content.
+ * A single, fully-closed `@lulaStart`/`@lulaEnd` annotation block.
+ *
+ * `occurrence` disambiguates multiple blocks that share the same UUID: it is the
+ * zero-based index of the block's `@lulaStart` marker among all start markers with
+ * that UUID, giving every block a stable identity even when UUIDs are duplicated.
+ */
+export interface MapBlock {
+	uuid: string;
+	occurrence: number;
+	startLine: number;
+	endLine: number;
+}
+
+/**
+ * An annotation marker that could not be paired into a complete block, recorded so
+ * that the caller can surface the problem instead of fabricating evidence from it.
+ */
+export interface MalformedMarker {
+	uuid: string | null;
+	line: number;
+	kind: 'unclosed-start' | 'unmatched-end';
+}
+
+const LULA_START_PATTERN = /@lulaStart\s+([a-f0-9-]+)/;
+const LULA_END_PATTERN = /@lulaEnd\s+([a-f0-9-]+)/;
+
+/**
+ * Extracts all complete `@lulaStart`/`@lulaEnd` blocks plus any malformed markers.
+ *
+ * Markers are matched with a per-UUID LIFO stack so that nested blocks and blocks
+ * sharing a UUID are closed against the most recently opened matching marker, never
+ * against an arbitrary earlier one. Unclosed start markers and end markers without a
+ * matching start are reported as malformed and never produce a block, which prevents
+ * line numbers and hashes from being attributed to the wrong object.
  *
  * @param content - The content to extract blocks from.
  *
- * @returns An array of objects containing the UUID, start line, and end line of each block.
+ * @returns The well-formed blocks (sorted by source position) and malformed markers.
  */
-export function extractMapBlocks(content: string): {
-	uuid: string;
-	startLine: number;
-	endLine: number;
-}[] {
+export function extractMapBlocksWithDiagnostics(content: string): {
+	blocks: MapBlock[];
+	malformed: MalformedMarker[];
+} {
 	const lines = content.split('\n');
-	interface MapBlock {
-		uuid: string;
-		startLine: number;
-		endLine: number;
-	}
 	const blocks: MapBlock[] = [];
-	const stack: { uuid: string; line: number }[] = [];
+	const malformed: MalformedMarker[] = [];
+
+	// One open-marker stack per UUID; each frame remembers its source line and the
+	// occurrence number assigned when the start marker was seen.
+	const openStacks = new Map<string, Array<{ line: number; occurrence: number }>>();
+	const occurrenceCounters = new Map<string, number>();
 
 	lines.forEach((line, idx) => {
-		const start = line.match(/@lulaStart\s+([a-f0-9-]+)/);
-		const end = line.match(/@lulaEnd\s+([a-f0-9-]+)/);
+		const start = line.match(LULA_START_PATTERN);
+		const end = line.match(LULA_END_PATTERN);
 
 		if (start) {
-			stack.push({ uuid: start[1], line: idx });
-		} else if (end) {
-			const last = stack.find((s) => s.uuid === end[1]);
-			if (last) {
-				blocks.push({ uuid: last.uuid, startLine: last.line, endLine: idx + 1 });
-				stack.splice(stack.indexOf(last), 1);
+			const uuid = start[1];
+			const occurrence = occurrenceCounters.get(uuid) ?? 0;
+			occurrenceCounters.set(uuid, occurrence + 1);
+
+			let stack = openStacks.get(uuid);
+			if (!stack) {
+				stack = [];
+				openStacks.set(uuid, stack);
+			}
+			stack.push({ line: idx, occurrence });
+			return;
+		}
+
+		if (end) {
+			const uuid = end[1];
+			const stack = openStacks.get(uuid);
+			const frame = stack?.pop();
+
+			if (!frame) {
+				// An end marker with no open matching start cannot identify a block.
+				malformed.push({ uuid, line: idx, kind: 'unmatched-end' });
+				return;
+			}
+
+			blocks.push({
+				uuid,
+				occurrence: frame.occurrence,
+				startLine: frame.line,
+				endLine: idx + 1
+			});
+
+			if (stack && stack.length === 0) {
+				openStacks.delete(uuid);
 			}
 		}
 	});
 
-	return blocks;
+	// Every marker still on a stack is a start that was never closed.
+	for (const [uuid, stack] of openStacks) {
+		for (const frame of stack) {
+			malformed.push({ uuid, line: frame.line, kind: 'unclosed-start' });
+		}
+	}
+
+	blocks.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+	return { blocks, malformed };
+}
+
+/**
+ * Extracts all complete @lulaStart and @lulaEnd blocks from the given content.
+ *
+ * Malformed (half-closed or unmatched) markers are excluded; use
+ * {@link extractMapBlocksWithDiagnostics} when the diagnostics are also needed.
+ *
+ * @param content - The content to extract blocks from.
+ *
+ * @returns An array of objects containing the UUID, occurrence, start line, and end
+ * line of each block.
+ */
+export function extractMapBlocks(content: string): MapBlock[] {
+	return extractMapBlocksWithDiagnostics(content).blocks;
 }
 
 /**
@@ -192,14 +274,10 @@ export function extractMapBlocks(content: string): {
 export function getChangedBlocks(
 	oldText: string,
 	newText: string
-): {
-	uuid: string;
-	startLine: number;
-	endLine: number;
-}[] {
+): MapBlock[] {
 	const oldBlocks = extractMapBlocks(oldText);
 	const newBlocks = extractMapBlocks(newText);
-	const changed = [];
+	const changed: MapBlock[] = [];
 
 	const oldLines = oldText.split('\n');
 	const newLines = newText.split('\n');
@@ -229,79 +307,61 @@ export function getChangedBlocks(
 		// If there is no old block with this UUID then skip it bc it is new
 		if (oldUuidBlocks.length === 0) continue;
 
-		if (oldUuidBlocks.length !== newUuidBlocks.length) {
-			// First, identify exact matches to prevent duplicate assignments
-			const exactMatches = new Set<number>(); // indices of new blocks that are exact matches
-			const oldBlocksWithoutMatches: number[] = []; // indices of old blocks without exact matches
-
-			// Find exact content matches first
-			for (let oldIndex = 0; oldIndex < oldUuidBlocks.length; oldIndex++) {
-				const oldBlock = oldUuidBlocks[oldIndex];
-				const oldContent = extractBlockContent(oldLines, oldBlock.startLine, oldBlock.endLine);
-
-				let foundMatch = false;
-				for (let newIndex = 0; newIndex < newUuidBlocks.length; newIndex++) {
-					if (exactMatches.has(newIndex)) continue; // Skip already matched new blocks
-
-					const newBlock = newUuidBlocks[newIndex];
-					const newContent = extractBlockContent(newLines, newBlock.startLine, newBlock.endLine);
-
-					if (oldContent === newContent) {
-						exactMatches.add(newIndex);
-						foundMatch = true;
-						break;
-					}
-				}
-
-				if (!foundMatch) {
-					oldBlocksWithoutMatches.push(oldIndex);
-				}
-			}
-
-			// For old blocks without exact matches, find closest unmatched new block
-			const usedNewBlocks = new Set<number>(exactMatches); // Start with exact matches
-
-			for (const oldIndex of oldBlocksWithoutMatches) {
-				const oldBlock = oldUuidBlocks[oldIndex];
-
-				// Find candidates from unmatched new blocks
-				const candidates: Array<{ index: number; block: (typeof newUuidBlocks)[0] }> = [];
-				for (let newIndex = 0; newIndex < newUuidBlocks.length; newIndex++) {
-					if (!usedNewBlocks.has(newIndex)) {
-						candidates.push({ index: newIndex, block: newUuidBlocks[newIndex] });
-					}
-				}
-
-				if (candidates.length > 0) {
-					// Choose the candidate with the closest position
-					const closest = candidates.reduce((best, candidate) => {
-						const bestDistance = Math.abs(oldBlock.startLine - best.block.startLine);
-						const candidateDistance = Math.abs(oldBlock.startLine - candidate.block.startLine);
-						return candidateDistance < bestDistance ? candidate : best;
-					});
-
-					changed.push(closest.block);
-					usedNewBlocks.add(closest.index); // Mark as used to prevent duplicates
-				}
-			}
-			continue;
+		// Block identity is (UUID, content). First consume every new block whose exact
+		// content already exists in an old block (multiset comparison). Unchanged blocks
+		// are matched this way, and a purely-added block only consumes itself, so it can
+		// never be mistaken for a modification of an existing block.
+		const oldContentCounts = new Map<string, number>();
+		for (const block of oldUuidBlocks) {
+			const content = extractBlockContent(oldLines, block.startLine, block.endLine);
+			oldContentCounts.set(content, (oldContentCounts.get(content) ?? 0) + 1);
 		}
 
-		// Same count - do optimal 1:1 pairing based on content similarity and position
-		const pairings = findOptimalPairings(oldUuidBlocks, newUuidBlocks, oldLines, newLines);
+		const matchedOldIndices = new Set<number>();
+		const unmatchedNewIndices: number[] = [];
 
-		// Check each pairing for content changes
-		for (const { oldBlock, newBlock } of pairings) {
-			const oldContent = extractBlockContent(oldLines, oldBlock.startLine, oldBlock.endLine);
+		newUuidBlocks.forEach((newBlock, newIndex) => {
 			const newContent = extractBlockContent(newLines, newBlock.startLine, newBlock.endLine);
+			const remaining = oldContentCounts.get(newContent) ?? 0;
 
-			if (oldContent !== newContent) {
-				changed.push(newBlock);
+			if (remaining > 0) {
+				oldContentCounts.set(newContent, remaining - 1);
+				const oldIndex = oldUuidBlocks.findIndex(
+					(indexBlock, index) =>
+						!matchedOldIndices.has(index) &&
+						extractBlockContent(oldLines, indexBlock.startLine, indexBlock.endLine) ===
+							newContent
+				);
+				if (oldIndex >= 0) matchedOldIndices.add(oldIndex);
+			} else {
+				unmatchedNewIndices.push(newIndex);
 			}
+		});
+
+		const unmatchedOldBlocks = oldUuidBlocks.filter(
+			(_, oldIndex) => !matchedOldIndices.has(oldIndex)
+		);
+		const unmatchedNewBlocks = unmatchedNewIndices.map((newIndex) => newUuidBlocks[newIndex]);
+
+		// Pair the residual (modified) blocks 1:1 using content similarity and position.
+		// Only new blocks that represent an existing old block are reported, so a block
+		// that was merely added is never flagged and each new block is reported at most once.
+		const pairings = findOptimalPairings(unmatchedOldBlocks, unmatchedNewBlocks, oldLines, newLines);
+
+		for (const { newBlock } of pairings) {
+			changed.push(newBlock);
 		}
 	}
 
-	return changed;
+	// De-duplicate defensively: one identity per finding, so a rerun never emits the
+	// same line/hash evidence twice within a single report.
+	const seen = new Set<string>();
+	return changed.filter((block) => {
+		const key = `${block.uuid}:${block.occurrence}:${block.startLine}:${block.endLine}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
 /**
@@ -309,8 +369,18 @@ export function getChangedBlocks(
  * Uses a combination of content similarity and positional proximity.
  */
 export function findOptimalPairings(
-	oldBlocks: Array<{ uuid: string; startLine: number; endLine: number }>,
-	newBlocks: Array<{ uuid: string; startLine: number; endLine: number }>,
+	oldBlocks: ReadonlyArray<{
+		uuid: string;
+		startLine: number;
+		endLine: number;
+		occurrence?: number;
+	}>,
+	newBlocks: ReadonlyArray<{
+		uuid: string;
+		startLine: number;
+		endLine: number;
+		occurrence?: number;
+	}>,
 	oldLines: string[],
 	newLines: string[]
 ): Array<{ oldBlock: (typeof oldBlocks)[0]; newBlock: (typeof newBlocks)[0] }> {
@@ -384,19 +454,72 @@ function extractBlockContent(lines: string[], startLine: number, endLine: number
 export function getRemovedBlocks(
 	oldText: string,
 	newText: string
-): {
-	uuid: string;
-	startLine: number;
-	endLine: number;
-}[] {
+): MapBlock[] {
 	const oldBlocks = extractMapBlocks(oldText);
 	const newBlocks = extractMapBlocks(newText);
-	const removed = [];
+	const removed: MapBlock[] = [];
 
+	const oldLines = oldText.split('\n');
+	const newLines = newText.split('\n');
+
+	// Match blocks per UUID. A UUID that disappears entirely means every old block with
+	// that UUID was removed. When a UUID still exists, blocks are compared as content
+	// multisets so that removing one of several blocks sharing a UUID is detected while
+	// an in-place content modification is treated as a change, not a removal.
+	const newBlocksByUuid = new Map<string, typeof newBlocks>();
+	for (const newBlock of newBlocks) {
+		const list = newBlocksByUuid.get(newBlock.uuid) ?? [];
+		list.push(newBlock);
+		newBlocksByUuid.set(newBlock.uuid, list);
+	}
+
+	const oldBlocksByUuid = new Map<string, typeof oldBlocks>();
 	for (const oldBlock of oldBlocks) {
-		const newMatch = newBlocks.find((b) => b.uuid === oldBlock.uuid);
-		if (!newMatch) {
-			removed.push(oldBlock);
+		const list = oldBlocksByUuid.get(oldBlock.uuid) ?? [];
+		list.push(oldBlock);
+		oldBlocksByUuid.set(oldBlock.uuid, list);
+	}
+
+	for (const [uuid, oldUuidBlocks] of oldBlocksByUuid) {
+		const newUuidBlocks = newBlocksByUuid.get(uuid) ?? [];
+
+		// The UUID no longer appears at all: all old blocks with it were removed.
+		if (newUuidBlocks.length === 0) {
+			removed.push(...oldUuidBlocks);
+			continue;
+		}
+
+		// The UUID still exists. Match identical content first (multiset), then mark at
+		// most (oldCount - newCount) surplus old blocks as removed. Prefer surplus blocks
+		// whose content has no new counterpart so unchanged blocks are never reported.
+		const surplus = oldUuidBlocks.length - newUuidBlocks.length;
+		if (surplus <= 0) continue;
+
+		const newContentCounts = new Map<string, number>();
+		for (const newBlock of newUuidBlocks) {
+			const content = extractBlockContent(newLines, newBlock.startLine, newBlock.endLine);
+			newContentCounts.set(content, (newContentCounts.get(content) ?? 0) + 1);
+		}
+
+		const unmatched: MapBlock[] = [];
+		const matched: MapBlock[] = [];
+		for (const oldBlock of oldUuidBlocks) {
+			const content = extractBlockContent(oldLines, oldBlock.startLine, oldBlock.endLine);
+			const remaining = newContentCounts.get(content) ?? 0;
+			if (remaining > 0) {
+				newContentCounts.set(content, remaining - 1);
+				matched.push(oldBlock);
+			} else {
+				unmatched.push(oldBlock);
+			}
+		}
+
+		// Report exactly `surplus` removals, preferring old blocks whose content is gone.
+		removed.push(...unmatched.slice(0, surplus));
+		if (unmatched.length < surplus) {
+			// Not enough content-mismatched blocks; fall back to matched ones to reach
+			// the exact surplus count required by the block counts.
+			removed.push(...matched.slice(0, surplus - unmatched.length));
 		}
 	}
 
@@ -596,6 +719,26 @@ export async function analyzeModifiedFiles(context: CrawlContext): Promise<{
 				fetchRawFileViaAPI({ octokit, owner, repo, path: oldPath, ref: baseSha }),
 				fetchRawFileViaAPI({ octokit, owner, repo, path: newPath, ref: headSha })
 			]);
+
+			// Surface malformed annotations explicitly. Half-closed or unmatched markers
+			// are excluded from block extraction, so they can never contribute line
+			// numbers or hashes to a finding, but they still need a visible warning.
+			for (const [revision, text] of [
+				['base', oldText],
+				['head', newText]
+			] as const) {
+				const { malformed } = extractMapBlocksWithDiagnostics(text);
+				for (const marker of malformed) {
+					const label =
+						marker.kind === 'unclosed-start'
+							? `@lulaStart without a matching @lulaEnd`
+							: `@lulaEnd without a matching @lulaStart`;
+					console.warn(
+						`Malformed Lula annotation in ${file.filename} (${revision}, line ${marker.line + 1}): ${label}` +
+							(marker.uuid ? ` for UUID ${marker.uuid}` : '')
+					);
+				}
+			}
 
 			const changedBlocks = getChangedBlocks(oldText, newText);
 			const removedBlocks = getRemovedBlocks(oldText, newText);
